@@ -22,6 +22,14 @@ It reproduces the quirks verified against the real engines (Studio 0.6.5 / milm 
 * 1.0 streams a tool call as one complete delta (id, name, full arguments); 0.6 sends the id and
   name first and then argument fragments. Ids are ``tool_0``... on both (the real 1.0.27 uses
   ``call_0_xxxxxxxx``; per-response either way).
+* store pulls: ``POST {store}/models`` upserts metadata (201 new / 200 existing; errors are
+  ``{"message","statusCode"}`` on 0.6 and ``{"error":{"code","message"}}`` on 1.0),
+  ``POST {store}/models/{id}/download {"url"}`` streams ``data: {"size","totalSize"}`` lines and
+  simply ends (as in the live download log of the six presets); the 1.0 store adds
+  ``POST {store}/hf/models/pull {"repo","quant","name"}`` whose stages ``resolving`` /
+  ``quant_required`` / ``resolved`` / ``already_exists`` / ``error`` follow the mmodelstore
+  1.11.7 source and the live 1.0.27 store (``name`` sets the id, ``id``/``modelId`` are ignored;
+  a missing repo is a 400, a malformed one a 500).
 
 Unverified guesses, marked in the code: a 0.6 store rejects ``action: load/unload`` with a 400
 naming the action, and a 1.0 store answers 404 when unloading a model that is not loaded.
@@ -51,6 +59,34 @@ NODE_ID = "976350e296903f45b2acc70bb52b75d7190775205d93b6226c2f0938"
 REPO_WORKSPACE = Path(__file__).resolve().parent.parent / "workspace"
 VERSIONS = {"0.6": "v3.22.8 (developer edition)", "1.0": "v3.30.26 (developer edition)"}
 DEFAULT_REGISTRY = ("qwen3-4b", "qwen3-4b-instruct-2507", "smollm2-360m")
+HF_REPOS: dict[str, list[dict[str, Any]]] = {
+    "unsloth/Qwen3-4B-Instruct-2507-GGUF": [
+        {"name": "Q4_K_M", "file": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "size": 2497281120},
+        {"name": "Q8_0", "file": "Qwen3-4B-Instruct-2507-Q8_0.gguf", "size": 4280408096},
+    ],
+    "Qwen/Qwen3-8B-GGUF": [
+        {"name": "Q4_K_M", "file": "Qwen3-8B-Q4_K_M.gguf", "size": 5027783488},
+        {"name": "Q8_0", "file": "Qwen3-8B-Q8_0.gguf", "size": 8709519808},
+    ],
+    "bartowski/HuggingFaceTB_SmolLM3-3B-GGUF": [
+        {"name": "Q4_K_M", "file": "HuggingFaceTB_SmolLM3-3B-Q4_K_M.gguf", "size": 1915305792},
+    ],
+    "lmstudio-community/SmolLM2-360M-Instruct-GGUF": [
+        {"name": "Q8_0", "file": "SmolLM2-360M-Instruct-Q8_0.gguf", "size": 386404992},
+    ],
+    "unsloth/Qwen3.5-4B-GGUF": [
+        {"name": "Q4_K_M", "file": "Qwen3.5-4B-Q4_K_M.gguf", "size": 2740937888},
+    ],
+    "unsloth/Qwen3.5-9B-GGUF": [
+        {"name": "Q4_K_M", "file": "Qwen3.5-9B-Q4_K_M.gguf", "size": 5680522464},
+    ],
+    "someone/Solo-Model-GGUF": [
+        {"name": "Q4_K_M", "file": "Solo-Model-Q4_K_M.gguf", "size": 1000000000},
+    ],
+}
+"""HuggingFace repos the fake 1.0 store can resolve: the six presets (real file names and sizes)
+plus a single-file repo for the store's auto-pick."""
+DEFAULT_SIZE = 2497281120
 
 
 def _sse(obj: object) -> str:
@@ -60,6 +96,19 @@ def _sse(obj: object) -> str:
 def _pieces(text: str) -> list[str]:
     """Split text into word-sized streaming deltas (keeps the whitespace glued to the word)."""
     return re.findall(r"\s*\S+|\s+", text)
+
+
+class _CutStream(httpx.SyncByteStream):
+    """Yields ``head`` and then fails like a connection the server closed mid-body."""
+
+    def __init__(self, head: bytes) -> None:
+        self._head = head
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self._head
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body (incomplete chunked read)"
+        )
 
 
 class FakeMimoe:
@@ -94,6 +143,25 @@ class FakeMimoe:
         self.loaded: list[str] = [model_id] if model_id else []
         self.registry: list[str] = sorted({model_id, *DEFAULT_REGISTRY} - {""})
         self.registry_sizes: dict[str, int | None] = {}
+        self.registry_ready: dict[str, bool] = {}
+        """Per-model ``readyToUse`` overrides (default ``True``); a finished pull sets ``True``."""
+        self.hf_repos: dict[str, list[dict[str, Any]]] = {
+            repo: [dict(f) for f in files] for repo, files in HF_REPOS.items()
+        }
+        """1.0 only: what the fake ``POST {store}/hf/models/pull`` can resolve."""
+        self.pull_fail: str | None = None
+        """When set, the next download stream fails with this message after one progress line."""
+        self.unload_error: tuple[int, str] | None = None
+        """When set, unload routes answer this ``(status, message)`` instead of unloading."""
+        self.pull_drop = False
+        """When ``True`` the next download stream is cut after its first progress line, as when
+        the store process dies mid-transfer (httpx raises ``RemoteProtocolError``)."""
+        self.sse_newline = "\n"
+        """Line separator of the store's download and pull streams (the real stores write LF;
+        ``"\\r\\n"`` exercises a client's CRLF handling)."""
+        self.registry_context: dict[str, int] = {}
+        """Per-model ``gguf.initContextSize`` overrides in registry entries (default 12000; the
+        real 1.0 store registers a HuggingFace pull with 32768)."""
         self.calls: list[dict] = []
         """Every chat body received, for assertions."""
         self.requests: list[httpx.Request] = []
@@ -203,6 +271,16 @@ class FakeMimoe:
             )
         if route == "/models" and request.method == "PUT":
             return self._store_action(request)
+        if route == "/models" and request.method == "POST":
+            return self._store_register(request)
+        if (
+            route.startswith("/models/")
+            and route.endswith("/download")
+            and request.method == "POST"
+        ):
+            return self._store_download(request, route[len("/models/") : -len("/download")])
+        if route == "/hf/models/pull" and request.method == "POST" and self.generation == "1.0":
+            return self._hf_pull(request)
         return httpx.Response(404, json={"error": {"code": 404, "message": "not found"}})
 
     def _store_action(self, request: httpx.Request) -> httpx.Response:
@@ -216,6 +294,8 @@ class FakeMimoe:
                 400, json={"error": {"code": 400, "message": f"unsupported action: {action}"}}
             )
         if action == "unload":
+            if self.unload_error:
+                return self._store_error(*self.unload_error)
             if model_id not in self.loaded:
                 # guess: not captured live
                 return httpx.Response(
@@ -236,6 +316,166 @@ class FakeMimoe:
             content=("".join(lines) + final + final).encode(),
             headers={"content-type": "text/event-stream"},
         )
+
+    def _store_error(self, status: int, message: str) -> httpx.Response:
+        """The store's error body: ``{message,statusCode}`` on 0.6 and ``{error:{code,message}}``
+        on 1.0."""
+        if self.generation == "0.6":
+            return httpx.Response(status, json={"message": message, "statusCode": status})
+        return httpx.Response(status, json={"error": {"code": status, "message": message}})
+
+    def _sse_response(self, payload: str) -> httpx.Response:
+        if self.sse_newline != "\n":
+            payload = payload.replace("\n", self.sse_newline)
+        return httpx.Response(
+            200, content=payload.encode(), headers={"content-type": "text/event-stream"}
+        )
+
+    def _cut_response(self, payload: str) -> httpx.Response:
+        """A stream that ends in a transport error after ``payload`` (server died)."""
+        if self.sse_newline != "\n":
+            payload = payload.replace("\n", self.sse_newline)
+        return httpx.Response(
+            200, stream=_CutStream(payload.encode()), headers={"content-type": "text/event-stream"}
+        )
+
+    def _store_register(self, request: httpx.Request) -> httpx.Response:
+        """``POST {store}/models``: upsert metadata, 201 when new, 200 when it existed."""
+        body = json.loads(request.content or b"{}")
+        model_id = str(body.get("id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", model_id):
+            return self._store_error(
+                400,
+                "Model id contains invalid characters. Use alphanumeric, dash, underscore, dot "
+                'only (no "/").',
+            )
+        if not body.get("version"):
+            return self._store_error(400, 'body is missing required "version"')
+        if body.get("kind") not in ("llm", "vlm", "embed", "onnx"):
+            return self._store_error(400, "body.kind must be one of llm, vlm, embed, onnx")
+        is_new = model_id not in self.registry
+        if is_new:
+            self.registry.append(model_id)
+            self.registry_ready[model_id] = False
+        return httpx.Response(201 if is_new else 200, json=self._registry_entry(model_id))
+
+    def _store_download(self, request: httpx.Request, model_id: str) -> httpx.Response:
+        """``POST {store}/models/{id}/download {"url"}``: ``{size,totalSize}`` lines, then end."""
+        if model_id not in self.registry:
+            return self._store_error(404, f"Model '{model_id}' not found")
+        body = json.loads(request.content or b"{}")
+        url = str(body.get("url") or "")
+        if not url:
+            return self._store_error(400, 'body is missing required "url"')
+        if self.registry_ready.get(model_id, True):
+            total = self.registry_sizes.get(model_id, DEFAULT_SIZE) or 0
+            return self._sse_response(_sse({"size": total, "totalSize": total}))
+        file = url.rsplit("/", 1)[-1]
+        size = next(
+            (f["size"] for files in self.hf_repos.values() for f in files if f["file"] == file),
+            1000000000,
+        )
+        return self._download_stream(model_id, int(size), [], hf=False)
+
+    def _hf_pull(self, request: httpx.Request) -> httpx.Response:
+        """``POST {store}/hf/models/pull``: the 1.0 store's stages (mmodelstore 1.11.7 source)."""
+        body = json.loads(request.content or b"{}")
+        repo = body.get("repo")
+        if not repo:
+            return self._store_error(400, "repo is required")
+        parts = str(repo).split("/")
+        if len(parts) != 2 or not all(parts) or " " in repo:
+            # verified live on 1.0.27: the format check answers 500, not 400
+            return self._store_error(
+                500, 'repo must be in owner/name format (e.g., "unsloth/Qwen3.5-35B-A3B-GGUF")'
+            )
+        quant = body.get("quant")
+        lines = [_sse({"stage": "resolving", "repo": repo, "quant": quant or "auto"})]
+        files = self.hf_repos.get(repo)
+        if files is None:
+            lines.append(
+                _sse(
+                    {
+                        "stage": "error",
+                        "message": f"HTTP 404: https://huggingface.co/api/models/{repo}",
+                    }
+                )
+            )
+            return self._sse_response("".join(lines))
+        names = [f["name"] for f in files]
+        if not quant:
+            if len(files) != 1:
+                available = [
+                    {"name": f["name"], "file": f["file"], "size": f["size"]} for f in files
+                ]
+                lines.append(_sse({"stage": "quant_required", "available": available}))
+                return self._sse_response("".join(lines))
+            chosen = files[0]
+        else:
+
+            def norm(text: object) -> str:
+                return str(text).upper().replace("-", "_")
+
+            chosen = next((f for f in files if norm(f["name"]) == norm(quant)), None)
+            if chosen is None:
+                lines.append(
+                    _sse(
+                        {
+                            "stage": "error",
+                            "message": f'Quantization "{quant}" not found in {repo}. '
+                            f"Available: {', '.join(names)}",
+                        }
+                    )
+                )
+                return self._sse_response("".join(lines))
+        model_id = str(body.get("name") or chosen["file"].removesuffix(".gguf"))
+        lines.append(
+            _sse(
+                {
+                    "stage": "resolved",
+                    "modelFile": chosen["file"],
+                    "mmprojFile": None,
+                    "kind": "llm",
+                    "modelId": model_id,
+                }
+            )
+        )
+        if model_id in self.registry and self.registry_ready.get(model_id, True):
+            exists: dict[str, Any] = {"stage": "already_exists", "modelId": model_id, "kind": "llm"}
+            size = self.registry_sizes.get(model_id, DEFAULT_SIZE)
+            if size is not None:  # verified live: absent for a model linked by local path
+                exists["totalSize"] = size
+            lines.append(_sse(exists))
+            return self._sse_response("".join(lines))
+        if model_id not in self.registry:
+            self.registry.append(model_id)
+        self.registry_ready[model_id] = False
+        return self._download_stream(model_id, int(chosen["size"]), lines, hf=True)
+
+    def _download_stream(
+        self, model_id: str, total: int, lines: list[str], *, hf: bool
+    ) -> httpx.Response:
+        """Progress lines 0 / 50 / 100 %, marking the model ready; ``pull_fail`` aborts after
+        the first line (an ``error`` stage on the hf route, otherwise the bare JSON body of the
+        route's ``sendError`` with no trailing newline, as ``res.end()`` writes it after the
+        headers went out); ``pull_drop`` cuts the stream after the first line instead."""
+        for step, done in enumerate((0, total // 2, total)):
+            lines.append(_sse({"size": done, "totalSize": total}))
+            if self.pull_drop and step == 0:
+                self.pull_drop = False
+                return self._cut_response("".join(lines))
+            if self.pull_fail and step == 0:
+                message, self.pull_fail = self.pull_fail, None
+                if hf:
+                    lines.append(_sse({"stage": "error", "message": message}))
+                elif self.generation == "0.6":
+                    lines.append(json.dumps({"message": message, "statusCode": 500}))
+                else:
+                    lines.append(json.dumps({"error": {"code": 500, "message": message}}))
+                return self._sse_response("".join(lines))
+        self.registry_ready[model_id] = True
+        self.registry_sizes[model_id] = total
+        return self._sse_response("".join(lines))
 
     def _rpc(self, request: httpx.Request) -> httpx.Response:
         try:
@@ -324,22 +564,35 @@ class FakeMimoe:
         return {"data": [self.model_entry(m) for m in self.loaded], "object": "list"}
 
     def _registry_entry(self, model_id: str) -> dict[str, Any]:
+        ready = self.registry_ready.get(model_id, True)
         entry: dict[str, Any] = {
             "id": model_id,
             "version": "1.0.0",
             "kind": "llm",
-            "readyToUse": True,
+            "readyToUse": ready,
             "createdAt": 1790318912697,
-            "gguf": {"initContextSize": 12000, "initGpuLayerSize": 99},
+            "gguf": {
+                "initContextSize": self.registry_context.get(model_id, 12000),
+                "initGpuLayerSize": 99,
+            },
         }
-        size = self.registry_sizes.get(model_id, 2497281120)
+        size = self.registry_sizes.get(model_id, DEFAULT_SIZE)
         if self.generation == "1.0":
-            entry.update({"_v": 2, "namespace": "", "status": "ready", "statusMessage": ""})
-            if size is None:
+            entry.update(
+                {
+                    "_v": 2,
+                    "namespace": "",
+                    "status": "ready" if ready else "downloading",
+                    "statusMessage": "",
+                }
+            )
+            if not ready:
+                pass  # no file yet: neither filePath nor totalSize
+            elif size is None:
                 entry["localPath"] = f"/Users/me/.mimoe/models/{model_id}.gguf"
             else:
                 entry["filePath"] = f"{model_id}/{model_id}.gguf"
-        if size is not None:
+        if ready and size is not None:
             entry["totalSize"] = size
         return entry
 
@@ -377,6 +630,9 @@ class FakeMimoe:
 
     def _unload(self, request: httpx.Request) -> httpx.Response:
         model_id = parse_qs(request.url.query.decode()).get("modelId", [""])[0]
+        if self.unload_error:
+            status, message = self.unload_error
+            return httpx.Response(status, json={"statusCode": status, "message": message})
         if model_id not in self.loaded:
             return httpx.Response(
                 404, json={"statusCode": 404, "message": f"model not found in cache: {model_id}"}
