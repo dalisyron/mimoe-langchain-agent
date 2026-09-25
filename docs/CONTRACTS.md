@@ -141,8 +141,9 @@ Checkpointer default `InMemorySaver()`.
 
 ## stream.py
 ```python
-def iter_events(agent, payload, config) -> Iterator[dict]          # sync, uses agent.stream(stream_mode=["messages", "updates"])
-async def aiter_events(agent, payload, config) -> AsyncIterator[dict]
+def iter_events(agent, payload, config=None, *, tool_ids: ToolCallIds | None = None) -> Iterator[dict]   # sync, agent.stream(stream_mode=["messages", "updates"])
+async def aiter_events(agent, payload, config=None, *, tool_ids: ToolCallIds | None = None) -> AsyncIterator[dict]
+class ToolCallIds: ...   # per-conversation-turn alias state: a repeated engine id ("tool_0") is emitted as "tool_0#2", "tool_0#3"; tool_result ids follow the alias
 ```
 `payload` is `{"messages": [HumanMessage]}` or `Command(resume={"decisions": [...]})`. Events
 (dicts with `"event"` plus fields), exactly:

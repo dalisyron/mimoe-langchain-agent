@@ -600,6 +600,7 @@ name = "mimoe-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "langchain" },
@@ -623,6 +624,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4" },
     { name = "fastapi", specifier = ">=0.141,<1" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "langchain", specifier = ">=1.4,<2" },
