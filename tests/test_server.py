@@ -12,15 +12,18 @@ browser sees as a live stream arrives here as one body of CRLF-separated frames.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
+import psutil
 import pytest
 from conftest import DEFAULT_SIZE, FakeMimoe
 from fastapi import FastAPI
@@ -593,6 +596,69 @@ async def test_client_disconnect_releases_the_lock_and_closes_the_run(harness: H
         assert text_of(events) == "Never delivered." and events[-1]["status"] == "completed"
     users = [m["content"] for m in harness.fake.calls[-1]["messages"] if m["role"] == "user"]
     assert users == ["hello", "again /no_think"]  # the cut turn's message stayed checkpointed
+
+
+async def test_client_disconnect_kills_a_running_snippet(
+    fake_mimoe: FakeMimoe, settings_tmp: Settings, tmp_path: Path
+) -> None:
+    """Stop (a disconnect) while an approved run_python sleeps: the run's cancel signal kills
+    the snippet's process tree instead of leaving it to run into its 30 s timeout."""
+    harness = make_harness(
+        fake_mimoe, dataclasses.replace(settings_tmp, auto_approve=True), tmp_path / "dist"
+    )
+    await harness.prime()
+    pid_file = settings_tmp.workspace / "snippet.pid"
+    code = "import os, time\nopen('snippet.pid', 'w').write(str(os.getpid()))\ntime.sleep(30)"
+    harness.fake.script(
+        {"tool_calls": [{"name": "run_python", "args": {"code": code}}]}, {"content": "Done."}
+    )
+    payload = json.dumps({"thread_id": "t9", "message": "run it"}).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/chat",
+        "raw_path": b"/api/chat",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"127.0.0.1"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+        ],
+        "client": ("127.0.0.1", 40000),
+        "server": ("127.0.0.1", 8000),
+    }
+    body_sent = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+        for _ in range(200):  # wait until the snippet is really running, then hang up
+            if pid_file.exists() and pid_file.read_text():
+                break
+            await asyncio.sleep(0.05)
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        return None
+
+    started = time.monotonic()
+    await asyncio.wait_for(harness.app(scope, receive, send), 20)
+    pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and psutil.pid_exists(pid):
+        if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+            break
+        await asyncio.sleep(0.05)
+    alive = psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    assert not alive, "the snippet survived the disconnect"
+    assert time.monotonic() - started < 15
+    assert not harness.runtime.lock("t9").locked()
 
 
 # -- readiness and health ------------------------------------------------------------------------

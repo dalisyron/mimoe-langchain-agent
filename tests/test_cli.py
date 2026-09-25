@@ -5,9 +5,13 @@ a socket, forks or sends a signal (Ctrl-C is simulated with ``KeyboardInterrupt`
 
 from __future__ import annotations
 
+import _thread
 import io
+import json
 import os
 import re
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -734,6 +738,109 @@ def test_ctrl_c_during_the_model_call_goes_through_the_real_graph(
     assert result.exit_code == 0, result.output
     assert "turn cancelled" in result.output and "Still here." in result.output
     assert [m["role"] for m in fake_mimoe.calls[-1]["messages"]] == ["system", "user", "user"]
+
+
+class _SlowStream(httpx.SyncByteStream):
+    """An SSE body that yields one chunk every ``delay`` seconds and notices an early close."""
+
+    def __init__(self, chunks: list[bytes], delay: float) -> None:
+        self.chunks, self.delay = chunks, delay
+        self.sent = 0
+        self.closed = False
+
+    def __iter__(self) -> Any:
+        for chunk in self.chunks:
+            if self.closed:
+                return
+            time.sleep(self.delay)
+            self.sent += 1
+            yield chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _slow_answer(words: int, delay: float) -> _SlowStream:
+    def sse(delta: dict[str, Any], finish: str | None = None) -> bytes:
+        chunk = {
+            "id": "chatcmpl-slow",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "qwen3-4b",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        return f"data: {json.dumps(chunk)}\n\n".encode()
+
+    chunks = [sse({"role": "assistant"})]
+    chunks += [sse({"content": f"word{i} "}) for i in range(words)]
+    chunks += [sse({}, "stop"), b"data: [DONE]\n\n"]
+    return _SlowStream(chunks, delay)
+
+
+def test_real_ctrl_c_ends_a_streaming_answer_at_once(
+    run: Run, fake_mimoe: FakeMimoe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real interrupt of the REPL thread while the model streams (the graph runs the model on
+    a pool thread): the turn ends within a second and the HTTP stream is closed early, instead
+    of the REPL waiting for the whole answer."""
+    real_handler = fake_mimoe.handler
+    slow = _slow_answer(words=80, delay=0.1)  # 8 s if read to the end
+    seen: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/chat/completions"):
+            body = json.loads(request.content)
+            if body.get("stream") and body["messages"][-1]["content"].startswith("slow"):
+                seen["started"] = time.monotonic()
+                threading.Timer(1.0, _thread.interrupt_main).start()
+                return httpx.Response(
+                    200, headers={"content-type": "text/event-stream"}, stream=slow
+                )
+            if "started" in seen and "next" not in seen:
+                seen["next"] = time.monotonic()
+        return real_handler(request)
+
+    monkeypatch.setattr(fake_mimoe, "handler", handler)
+    script(fake_mimoe, {"content": "Still here."})
+    result = run(input="slow question\nhi\n/quit\n")
+    assert result.exit_code == 0, result.output
+    assert "turn cancelled" in result.output and "Still here." in result.output
+    assert slow.sent < 40, f"the stream was read for {slow.sent} of 82 chunks"
+    assert seen["next"] - seen["started"] < 3.0
+
+
+def test_real_ctrl_c_kills_a_running_snippet(
+    run: Run, fake_mimoe: FakeMimoe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real interrupt while an approved run_python sleeps: the snippet's tree is killed, the
+    model is told it was cancelled, and the REPL is back within seconds, not after 30 s."""
+    real_handler = fake_mimoe.handler
+    armed: dict[str, bool] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = real_handler(request)
+        if (
+            request.url.path.endswith("/chat/completions")
+            and not armed
+            and len(fake_mimoe.calls) == 2
+        ):  # the probe, then the call that answers with run_python
+            armed["yes"] = True
+            threading.Timer(2.0, _thread.interrupt_main).start()
+        return response
+
+    monkeypatch.setattr(fake_mimoe, "handler", handler)
+    sleeper = {
+        "tool_calls": [{"name": "run_python", "args": {"code": "import time\ntime.sleep(30)"}}]
+    }
+    script(fake_mimoe, sleeper, {"content": "Still here."})
+    started = time.monotonic()
+    result = run("--auto-approve", input="go\nhi\n/quit\n")
+    assert result.exit_code == 0, result.output
+    assert time.monotonic() - started < 15.0
+    assert "turn cancelled" in result.output and "Still here." in result.output
+    sent = fake_mimoe.calls[-1]["messages"]
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool", "user"], sent
+    assert "cancelled by the user" in sent[3]["content"]
 
 
 def test_ctrl_c_during_preflight_exits_130(

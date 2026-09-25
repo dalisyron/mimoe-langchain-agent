@@ -25,8 +25,10 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import queue
 import re
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -83,6 +85,54 @@ REJECT_MESSAGE = (
     "The user declined to run this code. Tell the user it was not executed and stop; do not retry."
 )
 CANCELLED_RESULT = "ERROR: cancelled by the user before the tool finished"
+TURN_POLL_S = 0.1
+"""How often the REPL thread wakes while a turn runs; keeps Ctrl-C prompt on every OS."""
+CANCEL_WAIT_S = 15.0
+"""How long Ctrl-C waits for a cancelled turn to wind down before moving to a new thread."""
+
+
+class TurnCancelled(Exception):
+    """Raised inside the model call once the user has cancelled the turn."""
+
+
+class _Failed:
+    """Carries an exception from the turn's worker thread to the REPL thread."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+_DONE = object()
+
+
+def _cancel_handler(cancel: threading.Event) -> Any:
+    """A callback handler that aborts the model call at its next streamed chunk after Ctrl-C.
+
+    mimOE streams a chunk every few tens of milliseconds (progress chunks while it reads the
+    prompt), so raising from ``on_llm_new_token`` ends the HTTP stream almost at once; the
+    start hooks stop a new model call from beginning after the cancel.
+    """
+    from langchain_core.callbacks import BaseCallbackHandler
+
+    class CancelOnModelOutput(BaseCallbackHandler):
+        raise_error = True
+
+        def _check(self) -> None:
+            if cancel.is_set():
+                raise TurnCancelled("turn cancelled by the user")
+
+        def on_chat_model_start(self, *args: Any, **kwargs: Any) -> None:
+            self._check()
+
+        def on_llm_start(self, *args: Any, **kwargs: Any) -> None:
+            self._check()
+
+        def on_llm_new_token(self, *args: Any, **kwargs: Any) -> None:
+            self._check()
+
+    return CancelOnModelOutput()
+
+
 RED_FLAG_RE = re.compile(
     r"""socket|urllib|requests|httpx|subprocess|os\.system|shutil\.rmtree|os\.remove|open\(.*["']w"""
 )
@@ -571,6 +621,16 @@ class Session:
             "metadata": {"model": self.pre.model.id},
         }
 
+    def turn_config(self, cancel: threading.Event) -> dict[str, Any]:
+        """``run_config`` plus this turn's cancel signal: ``run_python`` kills its snippet when
+        the event is set, and the callback handler aborts the streaming model call."""
+        from mimoe_agent.tools.run_python import CANCEL_KEY
+
+        config = self.run_config
+        config["configurable"][CANCEL_KEY] = cancel
+        config["callbacks"] = [_cancel_handler(cancel)]
+        return config
+
     def build_agent(self) -> None:
         """(Re)build the agent for the current settings and preflight, keeping the threads."""
         from langgraph.checkpoint.memory import InMemorySaver
@@ -676,20 +736,78 @@ class Session:
             self.console.print(Text(stats.summary(verbose=self.verbose), style="dim"))
 
     def _stream(self, payload: Any, stats: TurnStats) -> Renderer:
+        """Run one graph pass on a worker thread and render its events on this thread.
+
+        LangGraph runs every node on a pool thread when events are streamed, and Python raises
+        ``KeyboardInterrupt`` only on the main thread, so the main thread never blocks inside
+        the graph: it waits on a queue with a short timeout. Ctrl-C then reaches it at once
+        (also on Windows, where untimed waits ignore Ctrl-C), and ``_abort_turn`` sets the
+        turn's cancel signal: the snippet's process tree is killed and the model stream ends.
+        """
         from mimoe_agent import stream as stream_module
 
         renderer = Renderer(
             self.console, stats, verbose=self.verbose, show_thinking=self.settings.think
         )
-        events = stream_module.iter_events(self.agent, payload, self.run_config)
+        cancel = threading.Event()
+        config = self.turn_config(cancel)
+        inbox: queue.SimpleQueue[Any] = queue.SimpleQueue()
+
+        def work() -> None:
+            events = stream_module.iter_events(self.agent, payload, config)
+            try:
+                for event in events:
+                    inbox.put(event)
+            except BaseException as exc:  # iter_events turns Exceptions into error events
+                inbox.put(_Failed(exc))
+            finally:
+                events.close()
+                inbox.put(_DONE)
+
+        worker = threading.Thread(target=work, name="mimoe-turn", daemon=True)
+        interrupted = False
         try:
             renderer.spin("thinking")
-            for event in events:
-                renderer.handle(event)
+            worker.start()
+            while True:
+                try:
+                    item = inbox.get(timeout=TURN_POLL_S)
+                except queue.Empty:
+                    continue
+                if item is _DONE:
+                    break
+                if isinstance(item, _Failed):
+                    raise item.exc
+                renderer.handle(item)
+        except KeyboardInterrupt:
+            interrupted = True
         finally:
             renderer.close()
-            events.close()
+        if interrupted:
+            self._abort_turn(worker, cancel)
+            raise KeyboardInterrupt
         return renderer
+
+    def _abort_turn(self, worker: threading.Thread, cancel: threading.Event) -> None:
+        """Signal the cancel and wait (briefly, interruptibly) for the worker to wind down.
+
+        A turn that is still running after CANCEL_WAIT_S (or after a second Ctrl-C) is left to
+        finish in the background; the session moves to a new thread so the two never share one.
+        """
+        cancel.set()
+        deadline = time.monotonic() + CANCEL_WAIT_S
+        with contextlib.suppress(KeyboardInterrupt):
+            while worker.is_alive() and time.monotonic() < deadline:
+                worker.join(TURN_POLL_S)
+        if worker.is_alive():
+            self.thread_id = uuid.uuid4().hex
+            self.console.print(
+                Text(
+                    "the cancelled turn is still finishing in the background; "
+                    "continuing in a new conversation",
+                    style="yellow",
+                )
+            )
 
     def ask_decisions(self, approval: Mapping[str, Any], attempt: int) -> list[dict[str, str]]:
         """Show every action request and collect one approve/reject decision per request."""
@@ -770,10 +888,18 @@ class Session:
         try:
             snapshot = self.agent.get_state(self.run_config)
             values = snapshot.values if isinstance(snapshot.values, Mapping) else {}
-            messages = values.get("messages") or []
-            last = messages[-1] if messages else None
-            if not isinstance(last, AIMessage) or not last.tool_calls:
+            messages = list(values.get("messages") or [])
+            # The last message that asked for tools; only tool results may follow it (a later
+            # human message would make it history that was already answered or repaired).
+            for index in range(len(messages) - 1, -1, -1):
+                message = messages[index]
+                if isinstance(message, AIMessage) and message.tool_calls:
+                    break
+                if not isinstance(message, ToolMessage):
+                    return
+            else:
                 return
+            answered = {m.tool_call_id for m in messages[index + 1 :] if isinstance(m, ToolMessage)}
             results = [
                 ToolMessage(
                     content=CANCELLED_RESULT,
@@ -781,9 +907,11 @@ class Session:
                     name=str(call.get("name") or APPROVAL_TOOL),
                     status="error",
                 )
-                for call in last.tool_calls
+                for call in messages[index].tool_calls
+                if str(call.get("id") or "") not in answered
             ]
-            self.agent.update_state(self.run_config, {"messages": results}, as_node="tools")
+            if results:
+                self.agent.update_state(self.run_config, {"messages": results}, as_node="tools")
         except Exception:
             return
 

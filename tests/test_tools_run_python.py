@@ -257,6 +257,73 @@ def test_timeout_kills_grandchild(ws: FakeWorkspace) -> None:
     assert text.startswith(f"exit_code: {res.exit_code} (killed: timed out after 2 s)")
 
 
+# 300 MB written byte by byte, so it is resident (a bare bytearray(n) may stay unmapped).
+HOG = (
+    "blob = b'x' * (300 * 1024 * 1024)\n"
+    "print('allocated', flush=True)\n"
+    "import time\n"
+    "time.sleep(30)\n"
+)
+
+
+def test_memory_cap_kills_the_child(ws: FakeWorkspace) -> None:
+    started = time.monotonic()
+    res = run_python_code(HOG, ws, allow_network=False, timeout_s=30.0, memory_limit_mb=120)
+    elapsed = time.monotonic() - started
+    assert res.killed_for_memory and not res.timed_out and not res.cancelled
+    assert elapsed < 10.0
+    text = format_result(res, timeout_s=30.0, memory_limit_mb=120)
+    assert "(killed: memory exceeded 120 MB; process the data in smaller pieces)" in text
+
+
+def test_memory_cap_counts_grandchildren(ws: FakeWorkspace) -> None:
+    code = (
+        "import subprocess, sys, time\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {HOG!r}])\n"
+        "print(child.pid, flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    res = run_python_code(code, ws, allow_network=False, timeout_s=30.0, memory_limit_mb=120)
+    assert res.killed_for_memory
+    grandchild = int(res.stdout.split()[0])
+    assert _wait_dead(grandchild), f"grandchild {grandchild} survived the memory kill"
+
+
+def test_normal_snippets_stay_well_under_the_default_cap(ws: FakeWorkspace) -> None:
+    code = "import pandas as pd\nprint(len(pd.read_csv('sales.csv')))"
+    res = run_python_code(code, ws, allow_network=False, timeout_s=30.0)
+    assert res.exit_code == 0 and res.stdout.strip() == "8" and not res.killed_for_memory
+
+
+def test_cancel_event_kills_the_tree(ws: FakeWorkspace) -> None:
+    cancel = threading.Event()
+    threading.Timer(1.0, cancel.set).start()
+    started = time.monotonic()
+    res = run_python_code(
+        "print('started', flush=True)\n" + SLEEPER,
+        ws,
+        allow_network=False,
+        timeout_s=30.0,
+        cancel=cancel,
+    )
+    elapsed = time.monotonic() - started
+    assert res.cancelled and not res.timed_out
+    assert 0.9 <= elapsed < 5.0
+    assert res.stdout.strip() == "started"
+    assert "(killed: cancelled by the user" in format_result(res, timeout_s=30.0)
+
+
+def test_tool_reads_the_cancel_event_from_the_run_config(ws: FakeWorkspace) -> None:
+    tool = make_run_python(ws, allow_network=False)  # type: ignore[arg-type]
+    assert list(tool.args) == ["code"], "the config parameter must not reach the model's schema"
+    cancel = threading.Event()
+    cancel.set()
+    started = time.monotonic()
+    out = tool.invoke({"code": SLEEPER}, config={"configurable": {rp.CANCEL_KEY: cancel}})
+    assert time.monotonic() - started < 5.0
+    assert "cancelled by the user" in out
+
+
 def test_output_flood_is_killed_by_size_poll(ws: FakeWorkspace) -> None:
     code = "import time\nwhile True:\n    print('y' * 65536)\n    time.sleep(0.001)\n"
     started = time.monotonic()

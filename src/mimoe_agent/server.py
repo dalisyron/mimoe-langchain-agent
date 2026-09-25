@@ -38,6 +38,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -245,12 +246,21 @@ def _log_status(text: str) -> None:
 
 
 class _Turn:
-    """The per-thread lock held for one SSE response; released exactly once."""
+    """The per-thread lock held for one SSE response, released exactly once, and the run's
+    cancel signal: ``run_python`` runs on an executor thread that task cancellation cannot
+    stop, so the teardown sets ``cancel`` and the snippet's process tree is killed."""
 
     def __init__(self, thread_id: str, lock: asyncio.Lock) -> None:
         self.thread_id = thread_id
+        self.cancel = threading.Event()
         self._lock = lock
         self._held = True
+
+    def config(self, base: dict[str, Any]) -> dict[str, Any]:
+        """``base`` run config plus this turn's cancel signal for ``run_python``."""
+        from mimoe_agent.tools.run_python import CANCEL_KEY
+
+        return {**base, "configurable": {**base["configurable"], CANCEL_KEY: self.cancel}}
 
     def release(self) -> None:
         if self._held:
@@ -270,6 +280,7 @@ class _Turn:
             while (event := await queue.get()) is not None:
                 yield sse_frame(event)
         finally:
+            self.cancel.set()  # a Stop or disconnect also kills a running snippet
             with anyio.CancelScope(shield=True):
                 if not pump.done():
                     pump.cancel()
@@ -654,7 +665,8 @@ def create_app(
                 raise _http(409, "an approval is pending on this thread", HINT_APPROVAL_PENDING)
             payload = {"messages": [HumanMessage(body.message)]}
             ids = runtime.tool_ids(body.thread_id, new_turn=True)
-            return turn.response(aiter_events(ready.agent, payload, config, tool_ids=ids))
+            events = aiter_events(ready.agent, payload, turn.config(config), tool_ids=ids)
+            return turn.response(events)
         except BaseException:
             turn.release()
             raise
@@ -676,7 +688,8 @@ def create_app(
             decisions = _decisions(body.decisions, interrupt.value)
             payload = Command(resume={"decisions": decisions})
             ids = runtime.tool_ids(body.thread_id, new_turn=False)
-            return turn.response(aiter_events(ready.agent, payload, config, tool_ids=ids))
+            events = aiter_events(ready.agent, payload, turn.config(config), tool_ids=ids)
+            return turn.response(events)
         except BaseException:
             turn.release()
             raise

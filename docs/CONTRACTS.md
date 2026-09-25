@@ -160,9 +160,11 @@ def build_tools(settings: Settings, client: MimoeClient | None = None) -> list[B
 class Workspace:  __init__(root: Path); resolve(rel: str) -> Path  (raises WorkspaceError on escape)
 def make_workspace_tools(ws: Workspace) -> list[BaseTool]     # list_files, read_file, search_files
 # run_python.py
-def make_run_python(ws: Workspace, *, allow_network: bool, timeout_s: float = 30.0) -> BaseTool
-@dataclass class RunResult: stdout: str; stderr: str; exit_code: int | None; timed_out: bool; killed_for_size: bool
-def run_python_code(code: str, ws: Workspace, *, allow_network: bool, timeout_s: float) -> RunResult   # pure function used by the tool and tests
+def make_run_python(ws: Workspace, *, allow_network: bool, timeout_s: float = 30.0, memory_limit_mb: int = MEMORY_LIMIT_MB) -> BaseTool
+@dataclass class RunResult: stdout: str; stderr: str; exit_code: int | None; timed_out: bool; killed_for_size: bool; killed_for_memory: bool = False; cancelled: bool = False
+def run_python_code(code: str, ws: Workspace, *, allow_network: bool, timeout_s: float, memory_limit_mb: int = MEMORY_LIMIT_MB, cancel: threading.Event | None = None) -> RunResult
+CANCEL_KEY = "mimoe_cancel"   # config["configurable"][CANCEL_KEY]: a threading.Event per turn; set by Ctrl-C (CLI) or Stop/disconnect (server), it kills the snippet's tree
+MEMORY_LIMIT_MB = 2048        # resident memory of the whole tree (psutil); above it the tree is killed
 # system.py
 calculator: BaseTool; now: BaseTool
 def make_git(ws: Workspace) -> BaseTool

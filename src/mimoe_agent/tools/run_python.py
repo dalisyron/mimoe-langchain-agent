@@ -2,10 +2,10 @@
 
 The snippet runs as the current user with the workspace as its working directory; the
 approval interrupt in the agent is the safety boundary. This module bounds accidents instead:
-a wall-clock timeout and an output cap that kill the whole process tree, capture to temp files
-(never pipes, so a grandchild cannot hang the parent), an allow-listed environment so the
-parent's secrets never reach the child, and an 8 KB result for the model. The child side lives
-in ``_runner.py``.
+a wall-clock timeout, an output cap and a memory cap that kill the whole process tree, a cancel
+signal from the client (Ctrl-C, Stop), capture to temp files (never pipes, so a grandchild
+cannot hang the parent), an allow-listed environment so the parent's secrets never reach the
+child, and an 8 KB result for the model. The child side lives in ``_runner.py``.
 
 The tree kill is a process-group kill: on POSIX a grandchild that calls ``setsid`` itself
 escapes it, and on Windows ``taskkill /T`` cannot reach grandchildren whose parent already
@@ -20,11 +20,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
+import psutil
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, StructuredTool
 
 if TYPE_CHECKING:
@@ -38,8 +41,17 @@ STREAM_CAP = 64 * 1024
 """Bytes of each stream kept in RunResult: the head of stdout, the tail of stderr."""
 STDERR_TAIL = 3_000
 """Characters of stderr the formatted result keeps before stdout fills the rest."""
-POLL_S = 0.25
-"""Seconds between checks of the capture files while the child runs."""
+MEMORY_LIMIT_MB = 2048
+"""Resident memory of the whole process tree at which it is killed. macOS enforces no memory
+rlimit, so without this a snippet that loops while building a list could push the machine into
+swap until it stops responding."""
+
+POLL_S = 0.1
+"""Seconds between checks of the capture files, the tree's memory and the cancel signal."""
+
+CANCEL_KEY = "mimoe_cancel"
+"""RunnableConfig ``configurable`` key under which a client passes a ``threading.Event``; when
+it is set, a running snippet's process tree is killed (Ctrl-C in the CLI, Stop in the web UI)."""
 NO_OUTPUT = "ERROR: the code produced no output. Print the values you need."
 
 _KEEP_ENV = frozenset({"SYSTEMROOT", "PATH", "TEMP", "TMP", "HOME", "USERPROFILE", "LANG"})
@@ -63,6 +75,8 @@ class RunResult:
     exit_code: int | None
     timed_out: bool
     killed_for_size: bool
+    killed_for_memory: bool = False
+    cancelled: bool = False
 
 
 def _child_env(*, allow_network: bool) -> dict[str, str]:
@@ -123,22 +137,58 @@ def _pause(proc: subprocess.Popen[bytes], seconds: float) -> None:
         proc.wait(timeout=seconds)
 
 
+def _tree_rss(root: psutil.Process) -> int:
+    """Resident bytes of ``root`` and every process below it (vanished ones count as 0)."""
+    try:
+        procs = [root, *root.children(recursive=True)]
+    except psutil.Error:
+        return 0
+    total = 0
+    for proc in procs:
+        try:
+            total += proc.memory_info().rss
+        except psutil.Error:
+            continue
+    return total
+
+
 def _supervise(
-    proc: subprocess.Popen[bytes], out_file: IO[bytes], err_file: IO[bytes], timeout_s: float
-) -> tuple[bool, bool]:
-    """Poll every POLL_S until exit, timeout or output flood; returns (timed_out, killed)."""
+    proc: subprocess.Popen[bytes],
+    out_file: IO[bytes],
+    err_file: IO[bytes],
+    timeout_s: float,
+    *,
+    memory_limit_mb: int,
+    cancel: threading.Event | None,
+) -> str | None:
+    """Poll every POLL_S until the child exits or one limit trips.
+
+    Returns why the tree was killed: ``"timeout"``, ``"output"``, ``"memory"`` or
+    ``"cancelled"``; ``None`` when the child exited on its own.
+    """
     deadline = time.monotonic() + timeout_s
+    memory_limit = memory_limit_mb * 1024 * 1024
+    try:
+        root: psutil.Process | None = psutil.Process(proc.pid)
+    except psutil.Error:
+        root = None  # already gone
     while proc.poll() is None:
-        captured = os.fstat(out_file.fileno()).st_size + os.fstat(err_file.fileno()).st_size
-        if captured > OUTPUT_LIMIT:
+        reason = None
+        if cancel is not None and cancel.is_set():
+            reason = "cancelled"
+        elif os.fstat(out_file.fileno()).st_size + os.fstat(err_file.fileno()).st_size > (
+            OUTPUT_LIMIT
+        ):
+            reason = "output"
+        elif root is not None and _tree_rss(root) > memory_limit:
+            reason = "memory"
+        elif time.monotonic() >= deadline:
+            reason = "timeout"
+        if reason is not None:
             _kill_tree(proc)
-            return False, True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _kill_tree(proc)
-            return True, False
-        _pause(proc, min(POLL_S, remaining))
-    return False, False
+            return reason
+        _pause(proc, min(POLL_S, max(deadline - time.monotonic(), 0.0)))
+    return None
 
 
 def _decode(data: bytes) -> str:
@@ -163,20 +213,30 @@ def _read_tail(capture: IO[bytes], cap: int) -> str:
 
 
 def run_python_code(
-    code: str, ws: Workspace, *, allow_network: bool, timeout_s: float
+    code: str,
+    ws: Workspace,
+    *,
+    allow_network: bool,
+    timeout_s: float,
+    memory_limit_mb: int = MEMORY_LIMIT_MB,
+    cancel: threading.Event | None = None,
 ) -> RunResult:
     """Run ``code`` in a fresh interpreter with the workspace as its working directory.
 
     The child is ``sys.executable -X utf8 -u -P _runner.py snippet.py`` in its own process
     group, with stdin closed, stdout/stderr captured to temp files and an allow-listed
-    environment. The capture files are polled every POLL_S seconds; the whole process tree is
-    killed after ``timeout_s`` seconds or once the captures exceed OUTPUT_LIMIT bytes.
+    environment. Every POLL_S seconds the parent checks the cancel signal, the capture files and
+    the memory of the whole tree; the tree is killed when ``cancel`` is set, after ``timeout_s``
+    seconds, once the captures exceed OUTPUT_LIMIT bytes, or once it holds more than
+    ``memory_limit_mb`` of resident memory.
 
     Args:
         code: Python source written by the model.
         ws: The workspace; its root becomes the child's current directory and ``sys.path[0]``.
         allow_network: Lift the child's socket guard (see ``_runner.py``).
         timeout_s: Wall-clock limit for the run.
+        memory_limit_mb: Resident-memory limit for the child and everything it spawns.
+        cancel: Set by the client to stop the run early (Ctrl-C, Stop).
 
     Returns:
         A RunResult with the stdout head, stderr tail, exit code and kill flags.
@@ -202,8 +262,15 @@ def run_python_code(
                 **_popen_kwargs(),
             )
             try:
-                timed_out, killed_for_size = _supervise(proc, out_file, err_file, timeout_s)
-            except BaseException:  # Ctrl-C in the CLI, cancellation in the server
+                reason = _supervise(
+                    proc,
+                    out_file,
+                    err_file,
+                    timeout_s,
+                    memory_limit_mb=memory_limit_mb,
+                    cancel=cancel,
+                )
+            except BaseException:  # an interrupt that did reach this thread
                 _kill_tree(proc)
                 raise
             if not _WINDOWS:
@@ -212,12 +279,16 @@ def run_python_code(
                 stdout=_read_head(out_file, STREAM_CAP),
                 stderr=_read_tail(err_file, STREAM_CAP),
                 exit_code=proc.returncode,
-                timed_out=timed_out,
-                killed_for_size=killed_for_size,
+                timed_out=reason == "timeout",
+                killed_for_size=reason == "output",
+                killed_for_memory=reason == "memory",
+                cancelled=reason == "cancelled",
             )
 
 
-def format_result(result: RunResult, *, timeout_s: float) -> str:
+def format_result(
+    result: RunResult, *, timeout_s: float, memory_limit_mb: int = MEMORY_LIMIT_MB
+) -> str:
     """Render a RunResult for the model in at most RESULT_CAP characters.
 
     Layout: an ``exit_code`` line with the kill flags, the head of stdout and the tail of
@@ -240,6 +311,12 @@ def format_result(result: RunResult, *, timeout_s: float) -> str:
         header += f" (killed: timed out after {timeout_s:g} s)"
     if result.killed_for_size:
         header += f" (killed: output exceeded {OUTPUT_LIMIT // (1024 * 1024)} MB)"
+    if result.killed_for_memory:
+        header += (
+            f" (killed: memory exceeded {memory_limit_mb} MB; process the data in smaller pieces)"
+        )
+    if result.cancelled:
+        header += " (killed: cancelled by the user; do not run it again unless asked)"
     if len(stderr) > STDERR_TAIL:
         stderr = "[... earlier stderr omitted]\n" + stderr[-STDERR_TAIL:]
     stderr_block = f"stderr:\n{stderr}" if stderr else "stderr: (empty)"
@@ -254,31 +331,49 @@ def format_result(result: RunResult, *, timeout_s: float) -> str:
     return f"{header}\n{stdout_block}\n{stderr_block}"
 
 
-def make_run_python(ws: Workspace, *, allow_network: bool, timeout_s: float = 30.0) -> BaseTool:
+def make_run_python(
+    ws: Workspace,
+    *,
+    allow_network: bool,
+    timeout_s: float = 30.0,
+    memory_limit_mb: int = MEMORY_LIMIT_MB,
+) -> BaseTool:
     """Build the ``run_python(code)`` tool bound to a workspace.
 
     Args:
         ws: Workspace whose root is the child's working directory.
         allow_network: Whether the child's socket guard is lifted (``--allow-network``).
         timeout_s: Wall-clock limit per run.
+        memory_limit_mb: Resident-memory limit per run (child and grandchildren).
 
     Returns:
-        A StructuredTool named ``run_python`` that returns text and never raises.
+        A StructuredTool named ``run_python`` that returns text and never raises. It reads a
+        cancel ``threading.Event`` from ``config["configurable"][CANCEL_KEY]`` when present.
     """
     network = "allowed" if allow_network else "disabled"
     description = (
         "Run a Python snippet with the workspace as the current directory and return what it "
         "prints; a trailing bare expression is echoed like in a notebook. Print the values you "
         "need; pandas and the standard library are available, output is capped at 8 KB, the run "
-        f"is killed after {timeout_s:g} s, and network access is {network}."
+        f"is killed after {timeout_s:g} s or above {memory_limit_mb // 1024:g} GB of memory, and "
+        f"network access is {network}."
     )
 
-    def run_python(code: str) -> str:
+    def run_python(code: str, config: RunnableConfig) -> str:
         """Run ``code`` in the child interpreter and return the formatted result."""
+        configurable = (config or {}).get("configurable") or {}
+        cancel = configurable.get(CANCEL_KEY)
         try:
-            result = run_python_code(code, ws, allow_network=allow_network, timeout_s=timeout_s)
+            result = run_python_code(
+                code,
+                ws,
+                allow_network=allow_network,
+                timeout_s=timeout_s,
+                memory_limit_mb=memory_limit_mb,
+                cancel=cancel if isinstance(cancel, threading.Event) else None,
+            )
         except Exception as exc:
             return f"ERROR: run_python could not run the code: {exc}"
-        return format_result(result, timeout_s=timeout_s)
+        return format_result(result, timeout_s=timeout_s, memory_limit_mb=memory_limit_mb)
 
     return StructuredTool.from_function(run_python, name="run_python", description=description)
