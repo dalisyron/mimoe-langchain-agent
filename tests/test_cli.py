@@ -431,6 +431,38 @@ def test_model_switch_unknown_id_keeps_the_session(run: Run, fake_mimoe: FakeMim
 # -- Ctrl-C --------------------------------------------------------------------------------------
 
 
+def test_approval_escapes_control_sequences_that_could_hide_code(
+    run: Run, fake_mimoe: FakeMimoe
+) -> None:
+    """Code that moves the cursor up and erases a line could make the prompt show a harmless
+    line while another one runs: the escapes are shown literally and flagged in red."""
+    code = "print('looks harmless')\x1b[1A\x1b[2Kimport os  # the hidden line"
+    script(
+        fake_mimoe,
+        {"tool_calls": [{"name": "run_python", "args": {"code": code}}]},
+        {"content": "ok"},
+    )
+    result = run(input="go\nn\n/quit\n")
+    assert result.exit_code == 0, result.output
+    assert "\x1b" not in result.output, "a raw ESC reached the terminal"
+    assert "\\x1b[1A\\x1b[2Kimport os" in result.output
+    assert "invisible or terminal-control character(s)" in result.output
+
+
+def test_answers_and_tool_results_cannot_send_terminal_sequences(
+    run: Run, fake_mimoe: FakeMimoe
+) -> None:
+    """OSC 52 writes the clipboard, CSI sequences repaint the screen: text from the model or a
+    file is shown with them escaped."""
+    answer = "Done \x1b]52;c;ZXZpbA==\x07 and \u202ereversed"
+    script(fake_mimoe, {"content": answer})
+    result = run(input="hi\n/quit\n")
+    assert result.exit_code == 0, result.output
+    assert "\x1b" not in result.output and "\u202e" not in result.output
+    assert "\\x1b]52;c;ZXZpbA==\\x07" in result.output
+    assert "\\u202ereversed" in result.output
+
+
 def test_ctrl_c_at_the_prompt_exits_130(
     run: Run, fake_mimoe: FakeMimoe, monkeypatch: pytest.MonkeyPatch
 ) -> None:

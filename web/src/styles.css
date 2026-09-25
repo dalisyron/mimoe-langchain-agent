@@ -38,6 +38,7 @@ button:disabled { opacity: .5; cursor: default; }
 .chip { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--border); white-space: nowrap; }
 .chip.ok { background: color-mix(in srgb, var(--ok) 25%, transparent); }
 .chip.warn { background: color-mix(in srgb, var(--warn) 30%, transparent); white-space: normal; }
+.chip.danger { background: color-mix(in srgb, var(--bad) 30%, transparent); white-space: normal; }
 .muted { color: var(--muted); font-size: 12px; align-self: center; }
 
 /* transcript */

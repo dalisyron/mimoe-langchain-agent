@@ -85,6 +85,41 @@ REJECT_MESSAGE = (
     "The user declined to run this code. Tell the user it was not executed and stop; do not retry."
 )
 CANCELLED_RESULT = "ERROR: cancelled by the user before the tool finished"
+# Characters a terminal would act on instead of showing (C0/C1 controls such as ESC, which
+# starts cursor-movement, colour, title and clipboard sequences), plus bidirectional overrides
+# and line separators that reorder or hide text. Everything the model or a tool produced is
+# shown with these escaped; the approval prompt also escapes zero-width characters.
+_UNSAFE_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+_UNSAFE_OR_INVISIBLE_RE = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064"
+    "\u2066-\u2069\ufeff]"
+)
+
+
+def _escape_char(match: re.Match[str]) -> str:
+    code = ord(match.group(0))
+    return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
+
+
+def terminal_safe(text: str, *, strict: bool = False) -> tuple[str, int]:
+    """``text`` with terminal control, bidi and (``strict``) zero-width characters escaped.
+
+    Returns the display text and how many characters were escaped. CRLF becomes LF first.
+    """
+    pattern = _UNSAFE_OR_INVISIBLE_RE if strict else _UNSAFE_RE
+    return pattern.subn(_escape_char, text.replace("\r\n", "\n"))
+
+
+def _safe_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return terminal_safe(value)[0]
+    if isinstance(value, Mapping):
+        return {key: _safe_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_safe_value(item) for item in value]
+    return value
+
+
 TURN_POLL_S = 0.1
 """How often the REPL thread wakes while a turn runs; keeps Ctrl-C prompt on every OS."""
 CANCEL_WAIT_S = 15.0
@@ -459,7 +494,14 @@ class Renderer:
     # -- events ------------------------------------------------------------------------------
 
     def handle(self, event: Mapping[str, Any]) -> None:
-        """Render one event from :func:`mimoe_agent.stream.iter_events`."""
+        """Render one event from :func:`mimoe_agent.stream.iter_events`.
+
+        Every string in it came from the model, a tool or the engine, so control sequences are
+        escaped before anything reaches the terminal (``approval_required`` keeps the raw code,
+        which ``ask_decisions`` escapes and flags itself).
+        """
+        if event.get("event") != "approval_required":
+            event = _safe_value(event)
         kind = event.get("event")
         if kind == "token":
             self._token(str(event.get("text") or ""))
@@ -825,7 +867,17 @@ class Session:
                 code, lexer = str(args.get("code") or ""), "python"
             else:
                 code, lexer = json.dumps(args, indent=2, ensure_ascii=False), "json"
-            self.console.print(Syntax(code, lexer, line_numbers=True, word_wrap=True))
+            shown, hidden = terminal_safe(code, strict=True)
+            self.console.print(Syntax(shown, lexer, line_numbers=True, word_wrap=True))
+            if hidden:
+                self.console.print(
+                    Text(
+                        f"warning: this code contains {hidden} invisible or terminal-control "
+                        "character(s), shown escaped above; they can make code look different "
+                        "from what runs",
+                        style="bold red",
+                    )
+                )
             flags = sorted({match.group(0) for match in RED_FLAG_RE.finditer(code)})
             if flags:
                 self.console.print(
