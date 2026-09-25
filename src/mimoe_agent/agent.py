@@ -69,8 +69,10 @@ def system_prompt(settings: Settings, pre: Preflight) -> str:
 def describe_run_python(tool_call: ToolCall, state: AgentState, runtime: Runtime) -> str:
     """Render a ``run_python`` approval request: the code in a fenced block plus the warning.
 
-    Used as the ``description`` of the human-in-the-loop interrupt, so the CLI, the web panel and
-    anyone reading the raw interrupt see the same text.
+    Used as the ``description`` of the human-in-the-loop interrupt, i.e. what an API consumer
+    reading the raw interrupt (``approval_required.action_requests[].description``) sees. The
+    CLI and the web panel do not show this text: they render ``args["code"]`` themselves,
+    escaped and checked for hidden characters.
     """
     code = str((tool_call.get("args") or {}).get("code", ""))
     # a snippet that itself contains backticks needs a fence longer than any run inside it
