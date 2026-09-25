@@ -816,9 +816,18 @@ class FakeMimoe:
 
 @pytest.fixture(autouse=True)
 def _clean_mimoe_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the developer's shell (MIMOE_*, OPENAI_*, LangSmith) out of every test."""
+    """Keep the developer's shell out of every test.
+
+    MIMOE_*, OPENAI_* and LangSmith variables would change the settings under test; GIT_* ones
+    (exported to every git hook, and inside a linked worktree) would point the git tests at the
+    developer's own repository; FORCE_COLOR and friends would put ANSI codes in rich's output.
+    """
+    colour = {"FORCE_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE", "CLICOLOR_FORCE", "PY_COLORS"}
     for name in list(os.environ):
-        if name.startswith((ENV_PREFIX, "OPENAI_", "LANGSMITH_", "LANGCHAIN_")):
+        upper = name.upper()
+        if upper.startswith((ENV_PREFIX, "OPENAI_", "LANGSMITH_", "LANGCHAIN_", "GIT_")) or (
+            upper in colour
+        ):
             monkeypatch.delenv(name, raising=False)
 
 

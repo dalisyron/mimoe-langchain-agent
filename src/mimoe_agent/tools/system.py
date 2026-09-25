@@ -386,9 +386,8 @@ GIT_LOG_COUNT = 20
 GIT_RESULT_CAP = 7_000  # chars; leaves room for the tail under GuardrailMiddleware's 8,000 cap
 _GIT_COMMANDS = ("status", "log", "diff")
 _GIT_STUB = "/usr/bin/git"  # macOS shim that launches the Command Line Tools installer
-_GIT_ENV_DROP = frozenset(
-    {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE"}
-)
+_FILTER_KEYS_RE = r"^filter\..*\.(clean|smudge|process)$"
+"""Repository config keys naming filter commands (``git config --get-regexp`` pattern)."""
 _STATUS_LEGEND = "(XY = index/worktree: M modified, A added, D deleted, R renamed, ?? untracked)"
 _UNBORN_HEAD_MARKERS = ("ambiguous argument 'head'", "bad revision 'head'")
 _CLT_HINT = (
@@ -457,13 +456,13 @@ def _pathspec(ws: WorkspaceLike, path: str | None) -> str | None:
 
 def _git_args(command: str, pathspec: str | None, *, against_head: bool = True) -> list[str]:
     if command == "status":
-        args = ["status", "--short", "--branch"]
+        args = ["status", "--short", "--branch", "--ignore-submodules=all"]
     elif command == "log":
         args = ["log", "--oneline", "-n", str(GIT_LOG_COUNT), "--no-decorate"]
     else:
         # Against HEAD, so changes already staged with `git add` count as uncommitted too; a
         # plain `git diff` (index vs worktree) would report "(no uncommitted changes)" for them.
-        args = ["diff", "--no-ext-diff", "--no-textconv", "--stat", "-p"]
+        args = ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--stat", "-p"]
         if against_head:
             args.append("HEAD")
     if pathspec is not None:
@@ -471,14 +470,82 @@ def _git_args(command: str, pathspec: str | None, *, against_head: bool = True) 
     return args
 
 
+def _git_env() -> dict[str, str]:
+    """The environment for git: no inherited ``GIT_*`` variable, no prompt, no pager.
+
+    A git hook, ``git rebase -x`` or a linked worktree exports ``GIT_DIR``, ``GIT_INDEX_FILE``
+    and friends; inherited, they would point every command at that other repository instead of
+    the workspace. None of them is needed for a local read-only command, so all are dropped.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    env.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "LC_ALL": "C",
+        }
+    )
+    return env
+
+
+def _run(cmd: Sequence[str], env: Mapping[str, str]) -> subprocess.CompletedProcess[bytes]:
+    extra: dict[str, Any] = {}
+    if sys.platform == "win32":
+        extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.run(
+        list(cmd),
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        timeout=GIT_TIMEOUT_S,
+        env=dict(env),
+        check=False,
+        **extra,
+    )
+
+
+def _filter_overrides(git_exe: str, root: Path, env: Mapping[str, str]) -> list[str]:
+    """``-c`` options that disable every filter driver the repository's own config defines.
+
+    ``filter.<name>.clean/smudge/process`` are shell commands git runs while it compares files,
+    so an untrusted workspace repository could run code through a "read-only" status or diff.
+    An empty command disables a driver. Only the repository's config is neutralised (drivers
+    from your global config, such as Git LFS, stay as you set them up).
+    """
+    overrides: list[str] = []
+    for scope in ("--local", "--worktree"):
+        try:
+            proc = _run(
+                [git_exe, "-C", str(root), "config", scope, "--get-regexp", _FILTER_KEYS_RE], env
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+            key = line.split(" ", 1)[0]  # filter.<name>.<field>; <name> may contain dots
+            name = key[len("filter.") : key.rfind(".")]
+            if name and f"filter.{name}.clean=" not in overrides:
+                for field in ("clean", "smudge", "process"):
+                    overrides += ["-c", f"filter.{name}.{field}="]
+                overrides += ["-c", f"filter.{name}.required=false"]
+    return overrides
+
+
 def _execute_git(git_exe: str, root: Path, args: Sequence[str]) -> tuple[int, str, str]:
-    """Run git without a shell, pager, prompt, hook or external driver; UTF-8 in and out."""
+    """Run git without a shell, pager, prompt, hook, filter or external driver; UTF-8 in and out.
+
+    ``core.hooksPath`` points below the null device, where no hook can exist; this matters
+    because ``git status`` and ``git diff`` rewrite the index, which fires ``post-index-change``.
+    """
+    env = _git_env()
     cmd = [
         git_exe,
         "--no-pager",
         "--no-optional-locks",
         "-C",
         str(root),
+        "-c",
+        f"core.hooksPath={os.devnull}",
         "-c",
         "core.quotepath=off",
         "-c",
@@ -487,23 +554,11 @@ def _execute_git(git_exe: str, root: Path, args: Sequence[str]) -> tuple[int, st
         "color.ui=never",
         "-c",
         "log.showSignature=false",
+        *_filter_overrides(git_exe, root, env),
         *args,
     ]
-    env = {key: value for key, value in os.environ.items() if key not in _GIT_ENV_DROP}
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "PAGER": "cat", "LC_ALL": "C"})
-    extra: dict[str, Any] = {}
-    if sys.platform == "win32":
-        extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            stdin=subprocess.DEVNULL,
-            timeout=GIT_TIMEOUT_S,
-            env=env,
-            check=False,
-            **extra,
-        )
+        proc = _run(cmd, env)
     except subprocess.TimeoutExpired as exc:
         raise _ToolError(
             f"ERROR: git timed out after {GIT_TIMEOUT_S:.0f} s; the repository may be very large "
@@ -553,6 +608,15 @@ def _shape_output(command: str, out: str, pathspec: str | None) -> str:
     return _cap(text, GIT_RESULT_CAP, "pass path=<file> to see one file")
 
 
+def _find_git() -> str | None:
+    """``git`` from PATH. On Windows the current directory is searched first by default (by
+    ``shutil.which`` and by ``CreateProcess``), so a stray ``git.cmd`` there would run instead;
+    ``NoDefaultCurrentDirectoryInExePath`` turns that search off for this process."""
+    if sys.platform == "win32":
+        os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
+    return shutil.which("git")
+
+
 def run_git(ws: WorkspaceLike, command: str, path: str | None = None) -> str:
     """Run one read-only git command for the workspace and return its output as text.
 
@@ -568,7 +632,7 @@ def run_git(ws: WorkspaceLike, command: str, path: str | None = None) -> str:
     if command not in _GIT_COMMANDS:
         return f"ERROR: unknown git command {command!r}; use status, log or diff."
     try:
-        git_exe = shutil.which("git")
+        git_exe = _find_git()
         if git_exe is None:
             return (
                 "ERROR: git is not installed (no `git` on PATH); install it from "

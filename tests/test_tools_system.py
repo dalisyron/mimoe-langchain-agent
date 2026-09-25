@@ -7,9 +7,11 @@ not installed. Nothing here needs a running mimOE engine.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
@@ -315,9 +317,44 @@ def _git(cwd: Path, *args: str) -> str:
         *args,
     ]
     proc = subprocess.run(
-        cmd, cwd=cwd, capture_output=True, check=True, timeout=30, stdin=subprocess.DEVNULL
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        check=True,
+        timeout=30,
+        stdin=subprocess.DEVNULL,
+        env=_git_test_env(),
     )
     return proc.stdout.decode("utf-8", errors="replace")
+
+
+# Variables that name another repository. A git hook (for example a pre-commit hook that runs
+# this suite) or a linked worktree exports them; inherited, they send the helper's `git commit`
+# to that repository, whose hook then runs the suite again: a runaway recursion.
+_GIT_LOCATION_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+)
+
+
+def _git_test_env() -> dict[str, str]:
+    """os.environ for the helper's git: no repository-location variable, no hooks' GIT_* state."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in _GIT_LOCATION_VARS
+        and not key.upper().startswith("GIT_CONFIG_KEY_")
+        and not key.upper().startswith("GIT_CONFIG_VALUE_")
+    }
 
 
 def _write(path: Path, text: str) -> None:
@@ -480,6 +517,61 @@ def test_git_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     assert out.startswith("ERROR: git is not installed")
 
 
+@needs_git
+def test_inherited_git_location_env_touches_no_other_repository(
+    tmp_path: Path, git_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run from a git hook (GIT_DIR/GIT_INDEX_FILE exported), neither the helpers nor the tool
+    may write to, or report on, that outer repository. No hook is installed here."""
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    _git(decoy, "init", "-q")
+    _write(decoy / "a.txt", "decoy\n")
+    _git(decoy, "add", ".")
+    _git(decoy, "commit", "-q", "-m", "decoy commit")
+    decoy_head = _git(decoy, "rev-parse", "HEAD")
+
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(decoy / ".git" / "index"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    _git(fresh, "init", "-q")
+    _write(fresh / "x.txt", "x\n")
+    _git(fresh, "add", ".")
+    _git(fresh, "commit", "-q", "-m", "fresh commit")
+    out = run_git(_Workspace(root=fresh.resolve()), "log")
+    assert "fresh commit" in out and "decoy commit" not in out
+
+    for name in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"):
+        monkeypatch.delenv(name)
+    assert _git(decoy, "rev-parse", "HEAD") == decoy_head
+    assert "fresh commit" not in _git(decoy, "log", "--oneline")
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="the spy hook and filter are POSIX shell")
+def test_git_tool_runs_no_repository_hook_or_filter(repo: _Workspace, tmp_path: Path) -> None:
+    """status and diff rewrite the index (firing post-index-change) and run clean filters; a
+    workspace repository must not get code executed that way. The spies only touch a file."""
+    hook_ran, filter_ran = tmp_path / "hook-ran", tmp_path / "filter-ran"
+    hook = repo.root / ".git" / "hooks" / "post-index-change"
+    _write(hook, f"#!/bin/sh\ntouch '{hook_ran}'\n")
+    hook.chmod(0o755)
+    _git(repo.root, "config", "filter.spy.clean", f"sh -c 'touch {filter_ran}; cat'")
+    _write(repo.root / ".gitattributes", "*.md filter=spy\n")
+    notes = repo.root / "notes.md"
+    for _ in range(2):
+        stamp = notes.stat().st_mtime + 5
+        os.utime(notes, (stamp, stamp))  # stat-dirty, same content: the case that runs both
+        assert run_git(repo, "status").startswith("## ")
+        run_git(repo, "diff")
+    _write(notes, "todo: two\n")  # a real edit
+    assert "todo: two" in run_git(repo, "diff")
+    assert not hook_ran.exists(), "a repository hook ran"
+    assert not filter_ran.exists(), "a repository filter ran"
+
+
 def test_git_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(system.shutil, "which", lambda *args, **kwargs: str(tmp_path / "git"))
 
@@ -514,6 +606,8 @@ def test_git_failure_messages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     )
 
     def scripted(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        if "config" in cmd and "--get-regexp" in cmd:  # the filter-driver lookup: none defined
+            return subprocess.CompletedProcess(cmd, 1, b"", b"")
         assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0" and "--no-pager" in cmd
         assert cmd[cmd.index("-C") + 1] == str(tmp_path)
         code, out, err = next(replies)
