@@ -78,17 +78,36 @@ def _tool_messages(fake: FakeMimoe) -> list[dict[str, Any]]:
 # -- start-up ------------------------------------------------------------------------------------
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    """Help text without ANSI styling (typer forces a styled terminal on GitHub Actions)."""
+    return ANSI_RE.sub("", text)
+
+
 def test_help_and_version(run: Run) -> None:
     result = run("--help")
     assert result.exit_code == 0
+    output = _plain(result.output)
     for flag in ("--workspace", "--model", "--think", "--auto-approve", "--allow-network"):
-        assert flag in result.output
-    assert "serve" in result.output and "models" in result.output
+        assert flag in output
+    assert "serve" in output and "models" in output
 
     models_help = run("models", "--help")
     assert models_help.exit_code == 0
     for command in ("list", "pull", "use", "unload"):
-        assert command in models_help.output
+        assert command in _plain(models_help.output)
+
+
+def test_help_survives_a_forced_styled_terminal(run: Run, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reproduces CI: typer.rich_utils.FORCE_TERMINAL is True when GITHUB_ACTIONS is set."""
+    import typer.rich_utils
+
+    monkeypatch.setattr(typer.rich_utils, "FORCE_TERMINAL", True)
+    result = run("--help")
+    assert result.exit_code == 0
+    assert "--workspace" in _plain(result.output)
 
     assert run("--version").output.strip() == "mimoe-agent 0.1.0"
 
