@@ -1,0 +1,49 @@
+[project]
+name = "mimoe-agent"
+version = "0.1.0"
+description = "A private, fully local dev/data assistant: a LangChain agent on the mimOE Studio on-device inference endpoint."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+authors = [{ name = "Mobin Dariush" }]
+dependencies = [
+  "langchain>=1.4,<2",
+  "langchain-openai>=1.6,<2",
+  "langgraph>=1.2,<2",
+  "fastapi>=0.141,<1",
+  "uvicorn[standard]>=0.34",
+  "sse-starlette>=2.2",
+  "httpx>=0.28",
+  "typer>=0.15",
+  "rich>=13.9",
+  "python-dotenv>=1.0",
+  "pandas>=2.2",
+  "tzdata>=2024.1; sys_platform == 'win32'",
+]
+
+[project.scripts]
+mimoe-agent = "mimoe_agent.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.25", "ruff>=0.9"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mimoe_agent"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = ["web", "workspace"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = ["live: needs a running mimOE Studio (set MIMOE_LIVE=1)"]
+addopts = "-m 'not live'"

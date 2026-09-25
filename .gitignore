@@ -1,0 +1,20 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+# node (web/dist is committed on purpose)
+node_modules/
+web/node_modules/
+web/.vite/
+# local
+.env
+.DS_Store
+# never part of the submission
+email.md
+*.dmg
+PLAN.md
