@@ -38,6 +38,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import mimetypes
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -711,6 +712,11 @@ def create_app(
         raise _http(404, f"no such endpoint: /api/{rest}", HINT_NOT_FOUND)
 
     if dist.is_dir():
+        # Starlette takes content types from the mimetypes module, which on Windows reads the
+        # registry, where .js is sometimes text/plain; browsers refuse such a module script and
+        # the UI stays blank. The bundle's own types are fixed here.
+        mimetypes.add_type("text/javascript", ".js")
+        mimetypes.add_type("text/css", ".css")
         app.mount("/", StaticFiles(directory=dist, html=True), name="ui")
     else:
 

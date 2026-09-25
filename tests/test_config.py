@@ -75,6 +75,13 @@ def test_dotenv_with_utf8_bom(workspace_tmp: Path) -> None:
     assert load_settings(cwd=workspace_tmp.parent).model == "bom-model"
 
 
+def test_dotenv_in_utf16(workspace_tmp: Path) -> None:
+    """Windows PowerShell 5.1 `echo MIMOE_MODEL=x > .env` writes UTF-16 with a BOM; it used to
+    crash every command with a UnicodeDecodeError."""
+    (workspace_tmp.parent / ".env").write_bytes("MIMOE_MODEL=utf16-model\r\n".encode("utf-16"))
+    assert load_settings(cwd=workspace_tmp.parent).model == "utf16-model"
+
+
 def test_dotenv_does_not_touch_process_env(workspace_tmp: Path) -> None:
     (workspace_tmp.parent / ".env").write_text("MIMOE_MODEL=quiet\nLANGSMITH_TRACING=true\n")
     settings = load_settings(cwd=workspace_tmp.parent)

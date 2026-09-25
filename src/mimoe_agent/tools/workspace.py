@@ -15,6 +15,7 @@ import os
 import stat
 import sys
 import time
+import unicodedata
 from collections.abc import Callable, Iterator
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -39,26 +40,43 @@ SKIP_DIRS: frozenset[str] = frozenset(
         "build",
     }
 )
-# File names that read_file refuses and search_files skips; matched case-insensitively.
+# Credential files that read_file refuses and search_files skips, matched after Unicode NFKC
+# normalisation and case folding. Deliberately specific: broad patterns such as *token* or
+# *secret* also hid ordinary source files (tokenizer.py, secrets_manager.py).
 SECRET_GLOBS: tuple[str, ...] = (
-    ".env*",
+    ".env",
+    ".env.*",
+    "*.env",
     "*.pem",
     "*.key",
     "*.p12",
     "*.pfx",
     "*.keystore",
-    "id_*",
-    "*.ppk",
     "*.jks",
-    "credentials*",
+    "*.ppk",
+    "*.kdbx",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    "credentials",
+    "credentials.*",
     ".netrc",
+    "_netrc",
     ".npmrc",
     ".pypirc",
     ".pgpass",
     ".htpasswd",
     ".git-credentials",
-    "*token*",
-    "*secret*",
+    "secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    "secrets.toml",
+    "*.secret",
+    "*.secrets",
+    "token.json",
+    "*.token",
+    "client_secret*.json",
 )
 
 OUTPUT_CAP = 8_000  # characters; equal to the GuardrailMiddleware result cap
@@ -148,8 +166,14 @@ class Workspace:
 
 
 def _is_secret(name: str) -> bool:
-    lowered = name.lower()
-    return any(fnmatch.fnmatchcase(lowered, glob) for glob in SECRET_GLOBS)
+    folded = unicodedata.normalize("NFKC", name).casefold()
+    return any(fnmatch.fnmatchcase(folded, glob) for glob in SECRET_GLOBS)
+
+
+def _utf16(data: bytes) -> bool:
+    """A UTF-16 byte-order mark: text that Windows tools (PowerShell 5.1 ``>``, Notepad's
+    "Unicode") write; its NUL bytes would otherwise make it look binary."""
+    return data.startswith((b"\xff\xfe", b"\xfe\xff"))
 
 
 def _looks_binary(sample: bytes) -> bool:
@@ -162,7 +186,9 @@ def _looks_binary(sample: bytes) -> bool:
 
 
 def _decode(data: bytes) -> tuple[str, str]:
-    """Decode as UTF-8 (BOM stripped), falling back to Windows-1252 with replacement."""
+    """Decode UTF-16 (by its BOM) or UTF-8 (BOM stripped), else Windows-1252 with replacement."""
+    if _utf16(data):
+        return data.decode("utf-16", errors="replace"), "utf-16"
     try:
         return data.decode("utf-8-sig"), "utf-8"
     except UnicodeDecodeError:
@@ -352,7 +378,7 @@ def _read_file(ws: Workspace, path: str, offset: int, limit: int) -> str:
         return f"error: {path!r} is not a regular file (device, socket or pipe); not readable"
     if len(data) > MAX_READ_BYTES:  # grew past the cap while being read
         return too_big
-    if _looks_binary(data[:BINARY_SNIFF_BYTES]):
+    if not _utf16(data) and _looks_binary(data[:BINARY_SNIFF_BYTES]):
         return f"error: {path!r} looks like a binary file ({size:,} bytes); use run_python instead"
 
     text, encoding = _decode(data)
@@ -412,6 +438,7 @@ def _search_files(ws: Workspace, pattern: str, path: str, glob: str, max_results
     hits = 0
     scanned = 0
     too_big = 0
+    credential_files = 0
     stopped = ""
     for file in _search_candidates(start):
         if time.monotonic() >= deadline:
@@ -422,10 +449,13 @@ def _search_files(ws: Workspace, pattern: str, path: str, glob: str, max_results
             break
         name = file.name
         rel = ws.rel(file)
-        if _is_secret(name) or not (
+        if not (
             fnmatch.fnmatchcase(name.lower(), name_glob)
             or fnmatch.fnmatchcase(rel.lower(), name_glob)
         ):
+            continue
+        if _is_secret(name):
+            credential_files += 1
             continue
         try:
             if file.is_symlink():
@@ -436,7 +466,7 @@ def _search_files(ws: Workspace, pattern: str, path: str, glob: str, max_results
             data = _read_capped(file, MAX_SEARCH_FILE_BYTES)  # never blocks on a FIFO or device
         except OSError:
             continue
-        if data is None or _looks_binary(data[:BINARY_SNIFF_BYTES]):
+        if data is None or (not _utf16(data) and _looks_binary(data[:BINARY_SNIFF_BYTES])):
             continue
         if len(data) > MAX_SEARCH_FILE_BYTES:  # grew past the cap while being read
             too_big += 1
@@ -462,6 +492,11 @@ def _search_files(ws: Workspace, pattern: str, path: str, glob: str, max_results
             break
 
     notes = [stopped] if stopped else []
+    if credential_files:
+        notes.append(
+            f"{credential_files} credential file{'s' if credential_files > 1 else ''} "
+            "(.env, keys and similar) not searched"
+        )
     if too_big:
         notes.append(
             f"{too_big} file{'s' if too_big > 1 else ''} over {MAX_SEARCH_FILE_BYTES:,} bytes "
@@ -521,15 +556,15 @@ def make_workspace_tools(ws: Workspace) -> list[BaseTool]:
 
     def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
         """Read a text file from the workspace with line numbers, starting at line offset.
-        Refuses binary files, files over 2 MB and secrets such as .env or key files; at most
-        200 lines per call, so page through long files with offset.
+        Refuses binary files, files over 2 MB and credential files (.env, private keys, .netrc
+        and similar); at most 200 lines per call, so page through long files with offset.
         """
         return _never_raise(lambda: _read_file(ws, path, offset, limit))
 
     def search_files(pattern: str, path: str = ".", glob: str = "*", max_results: int = 100) -> str:
         """Find lines containing a case-insensitive substring in workspace text files, returned
         as path:line: text. Plain text only (no regex); glob such as *.py filters file names;
-        at most 200 results.
+        skips binary and credential files; at most 200 results.
         """
         return _never_raise(lambda: _search_files(ws, pattern, path, glob, max_results))
 

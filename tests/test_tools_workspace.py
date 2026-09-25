@@ -367,8 +367,13 @@ class TestReadFile:
             "release.keystore",
             ".pgpass",
             ".htpasswd",
-            "api_token.txt",
-            "MySecrets.yaml",
+            "api.token",
+            "Secrets.YAML",
+            "prod.env",
+            "token.json",
+            "client_secret_123.apps.json",
+            "id_ed25519.pub",
+            "\uff0eenv",  # fullwidth full stop: NFKC turns it into ".env"
         ],
     )
     def test_secrets_refused(self, root: Path, tools: Tools, name: str) -> None:
@@ -377,9 +382,18 @@ class TestReadFile:
         assert out.startswith("error:")
         assert "secret" in out.lower()
 
-    def test_ordinary_files_are_not_secrets(self, tools: Tools) -> None:
+    def test_ordinary_files_are_not_secrets(self, root: Path, tools: Tools) -> None:
         assert not read(tools, "notes.md").startswith("error:")
         assert not read(tools, "src/app.py").startswith("error:")
+        for name in ("tokenizer.py", "secrets_manager.py", "id_utils.py", "csrf_token.py"):
+            write(root, name, "x = 1\n")
+            assert read(tools, name).startswith("1\t") or "x = 1" in read(tools, name), name
+
+    def test_utf16_text_is_read_not_refused_as_binary(self, root: Path, tools: Tools) -> None:
+        write(root, "windows.txt", "caf\u00e9 notes\r\n".encode("utf-16"))
+        out = read(tools, "windows.txt")
+        assert "café notes" in out and not out.startswith("error:")
+        assert "windows.txt:1: café notes" in search(tools, "CAFÉ")
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX-only")
     def test_fifo_refused(self, root: Path, tools: Tools) -> None:
@@ -619,7 +633,8 @@ class TestSearchFiles:
         out = search(tools, "needle")
         assert "plain.txt:1: needle here" in out
         assert "blob.bin" not in out
-        assert ".env" not in out
+        assert ".env:1" not in out and "NEEDLE=1" not in out
+        assert "1 credential file (.env, keys and similar) not searched" in out
         assert "node_modules" not in out
         assert "link.txt" not in out
 

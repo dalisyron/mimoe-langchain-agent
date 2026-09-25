@@ -3,9 +3,9 @@ name: ci
 on:
   push:
     branches: [main]
-    paths-ignore: ["**.md"]
+    paths-ignore: ["README.md", "docs/**"]  # the tests read workspace/README.md
   pull_request:
-    paths-ignore: ["**.md"]
+    paths-ignore: ["README.md", "docs/**"]
 
 jobs:
   lint:
@@ -13,8 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v10.2.0
-      - run: uvx ruff check .
-      - run: uvx ruff format --check .
+      - run: uv run --locked ruff check .  # the ruff version pinned in uv.lock
+      - run: uv run --locked ruff format --check .
 
   test:
     strategy:

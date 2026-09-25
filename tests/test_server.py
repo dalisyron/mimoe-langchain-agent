@@ -794,6 +794,27 @@ async def test_static_bundle_is_served_after_the_api_routes(
         assert (await client.get("/nope.txt")).status_code == 404
 
 
+async def test_bundle_scripts_are_javascript_even_if_the_registry_says_text_plain(
+    fake_mimoe: FakeMimoe, settings_tmp: Settings, tmp_path: Path
+) -> None:
+    """On Windows mimetypes reads the registry, where .js can be text/plain; a module script
+    with that type is refused by the browser and the UI stays blank."""
+    import mimetypes
+
+    dist = tmp_path / "web" / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    (dist / "assets" / "app.js").write_text("console.log(1)", encoding="utf-8")
+    mimetypes.add_type("text/plain", ".js")  # what such a registry makes of it
+    try:
+        harness = make_harness(fake_mimoe, settings_tmp, dist)
+        async with harness.client() as client:
+            asset = await client.get("/assets/app.js")
+            assert asset.headers["content-type"].startswith("text/javascript")
+    finally:
+        mimetypes.add_type("text/javascript", ".js")
+
+
 async def test_json_hint_without_a_web_bundle(harness: Harness) -> None:
     async with harness.client() as client:
         root = await client.get("/")

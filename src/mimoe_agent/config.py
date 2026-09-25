@@ -6,6 +6,7 @@ the CLI and server can show verbatim.
 
 from __future__ import annotations
 
+import io
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -151,11 +152,20 @@ def apply_tracing_env(settings: Settings) -> None:
         os.environ[var] = "false"
 
 
+def _read_text_file(path: Path) -> str:
+    """A small text file in UTF-8 (a BOM would hide the first key) or, by its BOM, UTF-16:
+    what ``echo MIMOE_MODEL=... > .env`` writes in Windows PowerShell 5.1."""
+    data = path.read_bytes()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    return data.decode("utf-8-sig", errors="replace")
+
+
 def _read_dotenv(path: Path) -> dict[str, str]:
     """Return the ``MIMOE_*`` string settings found in ``path`` (never booleans, never parents)."""
     if not path.is_file():
         return {}
-    values = dotenv_values(path, encoding="utf-8-sig")  # a BOM would hide the first key
+    values = dotenv_values(stream=io.StringIO(_read_text_file(path)))
     found: dict[str, str] = {}
     for name in DOTENV_FIELDS:
         value = values.get(env_name(name))
