@@ -1,7 +1,12 @@
-"""Agent assembly: the system prompt now; ``build_agent`` arrives in step C3."""
+"""Agent assembly: the system prompt and ``build_agent``.
+
+LangChain is imported inside :func:`build_agent` so that entry points can call
+:func:`mimoe_agent.config.apply_tracing_env` before any LangChain module is loaded.
+"""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -9,9 +14,13 @@ from mimoe_agent.config import Settings
 from mimoe_agent.mimoe import Preflight
 
 if TYPE_CHECKING:
+    from langchain.agents.middleware import AgentState
     from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import ToolCall
     from langchain_core.tools import BaseTool
     from langgraph.checkpoint.base import BaseCheckpointSaver
+    from langgraph.graph.state import CompiledStateGraph
+    from langgraph.runtime import Runtime
 
 NO_THINK = "/no_think"
 
@@ -36,6 +45,12 @@ SYSTEM_PROMPT_CHAT_ONLY = (
 )
 """Prompt used when the preflight disabled tools (chat-only mode)."""
 
+APPROVAL_WARNING = "this code runs as you, with your files"
+"""The line every approval request ends with (CLI, web and the interrupt payload agree)."""
+APPROVAL_TOOL = "run_python"
+"""The only tool gated by human approval."""
+_BACKTICK_RUNS = re.compile(r"`+")
+
 
 def system_prompt(settings: Settings, pre: Preflight) -> str:
     """Return the system prompt for this session.
@@ -51,6 +66,23 @@ def system_prompt(settings: Settings, pre: Preflight) -> str:
     return text
 
 
+def describe_run_python(tool_call: ToolCall, state: AgentState, runtime: Runtime) -> str:
+    """Render a ``run_python`` approval request: the code in a fenced block plus the warning.
+
+    Used as the ``description`` of the human-in-the-loop interrupt, so the CLI, the web panel and
+    anyone reading the raw interrupt see the same text.
+    """
+    code = str((tool_call.get("args") or {}).get("code", ""))
+    # a snippet that itself contains backticks needs a fence longer than any run inside it
+    longest_run = max((len(run) for run in _BACKTICK_RUNS.findall(code)), default=0)
+    fence = "`" * max(3, longest_run + 1)
+    return (
+        f"{APPROVAL_TOOL} wants to run this code:\n\n"
+        f"{fence}python\n{code}\n{fence}\n\n"
+        f"{APPROVAL_WARNING}"
+    )
+
+
 def build_agent(
     settings: Settings,
     pre: Preflight,
@@ -58,6 +90,67 @@ def build_agent(
     llm: BaseChatModel | None = None,
     tools: Sequence[BaseTool] | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
-) -> Any:
-    """Assemble the LangChain agent (middleware, tools, checkpointer); implemented in step C3."""
-    raise NotImplementedError("step C3")
+) -> CompiledStateGraph[Any, Any, Any, Any]:
+    """Assemble the LangChain agent for one session.
+
+    Args:
+        settings: Effective settings (``think``, ``auto_approve``, ``workspace``...).
+        pre: Preflight result (model id, thinking control, whether tools are enabled).
+        llm: Chat model to use; defaults to :func:`mimoe_agent.llm.make_model`.
+        tools: Tools to bind; defaults to :func:`mimoe_agent.tools.build_tools`. Ignored (no
+            tools at all) when the preflight disabled tools.
+        checkpointer: Checkpointer for threads and approval interrupts; defaults to an
+            ``InMemorySaver``.
+
+    Returns:
+        The compiled agent graph. Middleware, outermost first: ``QwenMiddleware`` (think handling,
+        ``/no_think``), ``GuardrailMiddleware`` (result caps, tool errors, per-turn budget reset),
+        ``ModelCallLimitMiddleware(thread_limit=8, exit_behavior="end")`` and, unless
+        ``settings.auto_approve``, ``HumanInTheLoopMiddleware`` on ``run_python`` with the decisions
+        ``approve``/``reject``.
+    """
+    from langchain.agents import create_agent
+    from langchain.agents.middleware import (
+        HumanInTheLoopMiddleware,
+        InterruptOnConfig,
+        ModelCallLimitMiddleware,
+    )
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from mimoe_agent.llm import make_model
+    from mimoe_agent.middleware import GuardrailMiddleware, QwenMiddleware
+    from mimoe_agent.tools import build_tools
+
+    model = llm if llm is not None else make_model(settings, pre)
+    agent_tools: list[BaseTool]
+    if not pre.tools_enabled:
+        agent_tools = []
+    elif tools is not None:
+        agent_tools = list(tools)
+    else:
+        agent_tools = build_tools(settings)
+
+    guard = GuardrailMiddleware()
+    middleware: list[Any] = [
+        QwenMiddleware(soft_no_think=pre.thinking_control == "soft" and not settings.think),
+        guard,
+        ModelCallLimitMiddleware(thread_limit=guard.thread_limit, exit_behavior="end"),
+    ]
+    if not settings.auto_approve:
+        middleware.append(
+            HumanInTheLoopMiddleware(
+                interrupt_on={
+                    APPROVAL_TOOL: InterruptOnConfig(
+                        allowed_decisions=["approve", "reject"],
+                        description=describe_run_python,
+                    )
+                }
+            )
+        )
+    return create_agent(
+        model,
+        tools=agent_tools,
+        system_prompt=system_prompt(settings, pre),
+        middleware=middleware,
+        checkpointer=checkpointer if checkpointer is not None else InMemorySaver(),
+    )

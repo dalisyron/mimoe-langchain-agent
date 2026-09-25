@@ -7,12 +7,19 @@ from pathlib import Path
 
 import pytest
 from conftest import FakeMimoe
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
 from mimoe_agent.agent import SYSTEM_PROMPT, system_prompt
 from mimoe_agent.config import Settings, load_settings
-from mimoe_agent.llm import MAX_TOKENS, MAX_TOKENS_THINK, REQUEST_TIMEOUT_S, make_model
+from mimoe_agent.llm import (
+    MAX_TOKENS,
+    MAX_TOKENS_THINK,
+    REASONING_KEY,
+    REQUEST_TIMEOUT_S,
+    MimoeChatOpenAI,
+    make_model,
+)
 from mimoe_agent.mimoe import MimoeClient, Preflight, preflight
 
 
@@ -150,3 +157,92 @@ def test_default_http_clients_ignore_proxy_env(
     llm = make_model(settings_tmp, preflight_fake)
     assert llm.http_client is not None and llm.http_client.trust_env is False
     assert llm.http_async_client is not None and llm.http_async_client.trust_env is False
+
+
+# -- MimoeChatOpenAI: reasoning_content capture (1.0 engines) -------------------------------------
+
+
+def _v10(workspace_tmp: Path, **overrides: object) -> tuple[FakeMimoe, ChatOpenAI]:
+    fake = FakeMimoe("1.0")
+    settings = load_settings(
+        {"workspace": workspace_tmp, "base_url": fake.base_url, **overrides},
+        cwd=workspace_tmp.parent,
+    )
+    llm, _ = _build(fake, settings)
+    fake.calls.clear()
+    return fake, llm
+
+
+def test_make_model_returns_the_mimoe_subclass(llm_fake: ChatOpenAI) -> None:
+    assert isinstance(llm_fake, MimoeChatOpenAI)
+    assert isinstance(llm_fake, ChatOpenAI)
+
+
+def test_reasoning_content_captured_on_invoke(workspace_tmp: Path) -> None:
+    fake, llm = _v10(workspace_tmp, think=True)
+    fake.script({"content": "four", "reasoning": "two plus two"})
+    message = llm.invoke("2+2?")
+    assert message.content == "four"
+    assert message.additional_kwargs[REASONING_KEY] == "two plus two"
+    assert fake.calls[-1]["enable_thinking"] is True
+
+
+def test_reasoning_content_captured_on_stream(workspace_tmp: Path) -> None:
+    fake, llm = _v10(workspace_tmp, think=True)
+    fake.script({"content": "four", "reasoning": "two plus two"})
+    chunks = list(llm.stream("2+2?"))
+    pieces = [
+        c.additional_kwargs[REASONING_KEY] for c in chunks if REASONING_KEY in c.additional_kwargs
+    ]
+    assert len(pieces) > 1 and "".join(pieces) == "two plus two"  # every delta is a chunk
+    assert all(c.content == "" for c in chunks if REASONING_KEY in c.additional_kwargs)
+    merged = chunks[0]
+    for chunk in chunks[1:]:
+        merged = merged + chunk
+    assert merged.content == "four"
+    assert merged.additional_kwargs[REASONING_KEY] == "two plus two"
+    assert merged.usage_metadata is not None
+    assert fake.calls[-1]["stream"] is True
+
+
+async def test_reasoning_content_captured_on_astream(workspace_tmp: Path) -> None:
+    fake, llm = _v10(workspace_tmp, think=True)
+    fake.script({"content": "four", "reasoning": "two plus two"})
+    chunks = [chunk async for chunk in llm.astream("2+2?")]
+    pieces = [
+        c.additional_kwargs[REASONING_KEY] for c in chunks if REASONING_KEY in c.additional_kwargs
+    ]
+    assert "".join(pieces) == "two plus two"
+    merged = chunks[0]
+    for chunk in chunks[1:]:
+        merged = merged + chunk
+    assert merged.content == "four"
+    assert merged.additional_kwargs[REASONING_KEY] == "two plus two"
+
+
+def test_reasoning_content_absent_when_not_sent(
+    workspace_tmp: Path, llm_fake: ChatOpenAI, fake_mimoe: FakeMimoe
+) -> None:
+    fake, llm = _v10(workspace_tmp)
+    fake.script({"content": "four"})
+    assert REASONING_KEY not in llm.invoke("2+2?").additional_kwargs
+    fake.script({"content": "four"})
+    merged = None
+    for chunk in llm.stream("2+2?"):
+        merged = chunk if merged is None else merged + chunk
+    assert merged is not None and REASONING_KEY not in merged.additional_kwargs
+
+    fake_mimoe.script({"content": "four", "reasoning": "inline"})  # 0.6: inline, not extracted here
+    message = llm_fake.invoke("2+2?")
+    assert REASONING_KEY not in message.additional_kwargs
+    assert message.content == "<think>\ninline\n</think>\n\nfour"  # QwenMiddleware's job
+
+
+def test_reasoning_content_is_never_sent_back(llm_fake: ChatOpenAI) -> None:
+    history = [
+        HumanMessage("2+2?"),
+        AIMessage(content="four", additional_kwargs={REASONING_KEY: "two plus two"}),
+        HumanMessage("and 3+3?"),
+    ]
+    assistant = llm_fake._get_request_payload(history)["messages"][1]
+    assert assistant == {"role": "assistant", "content": "four"}
