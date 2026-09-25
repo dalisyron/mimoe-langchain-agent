@@ -53,6 +53,11 @@ CANCEL_KEY = "mimoe_cancel"
 """RunnableConfig ``configurable`` key under which a client passes a ``threading.Event``; when
 it is set, a running snippet's process tree is killed (Ctrl-C in the CLI, Stop in the web UI)."""
 NO_OUTPUT = "ERROR: the code produced no output. Print the values you need."
+ESCAPED_NEWLINES = (
+    "ERROR: SyntaxError: the code contains the two characters \\n where line breaks belong, so "
+    "it is one invalid line. Send the code again with real line breaks (or join the statements "
+    "with ';'). Nothing was run."
+)
 
 _KEEP_ENV = frozenset({"SYSTEMROOT", "PATH", "TEMP", "TMP", "HOME", "USERPROFILE", "LANG"})
 _RUNNER = Path(__file__).with_name("_runner.py")
@@ -331,6 +336,22 @@ def format_result(
     return f"{header}\n{stdout_block}\n{stderr_block}"
 
 
+def _escaped_newlines(code: str) -> bool:
+    """True when ``code`` is one line with literal ``\\n`` escapes that does not compile.
+
+    Small models sometimes JSON-escape twice, so the code reaches the tool as
+    ``print(1)\\nprint(2)``; Python then reports only "unexpected character after line
+    continuation character" and the model tends to resend the same thing. Compiling runs nothing.
+    """
+    if "\n" in code.strip() or "\\n" not in code:
+        return False
+    try:
+        compile(code, "snippet.py", "exec")
+    except SyntaxError:
+        return True
+    return False
+
+
 def make_run_python(
     ws: Workspace,
     *,
@@ -361,6 +382,8 @@ def make_run_python(
 
     def run_python(code: str, config: RunnableConfig) -> str:
         """Run ``code`` in the child interpreter and return the formatted result."""
+        if _escaped_newlines(code):
+            return ESCAPED_NEWLINES
         configurable = (config or {}).get("configurable") or {}
         cancel = configurable.get(CANCEL_KEY)
         try:

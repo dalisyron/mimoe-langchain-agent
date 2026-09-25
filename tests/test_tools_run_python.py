@@ -324,6 +324,25 @@ def test_tool_reads_the_cancel_event_from_the_run_config(ws: FakeWorkspace) -> N
     assert "cancelled by the user" in out
 
 
+def test_escaped_newlines_get_a_targeted_error_and_nothing_runs(
+    ws: FakeWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """qwen3-4b sometimes sends code with the two characters backslash-n instead of line breaks;
+    the tool says so instead of returning a bare SyntaxError the model tends to repeat."""
+    spawned: list[object] = []
+    monkeypatch.setattr(rp.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    tool = make_run_python(ws, allow_network=False)  # type: ignore[arg-type]
+    code = "print('" + "caf" + "\u00e9" + "')" + "\\n" + "import os" + "\\n" + "print(os.getcwd())"
+    assert tool.invoke({"code": code}) == rp.ESCAPED_NEWLINES
+    assert spawned == []
+
+
+def test_newline_escapes_inside_strings_still_run(ws: FakeWorkspace) -> None:
+    tool = make_run_python(ws, allow_network=False)  # type: ignore[arg-type]
+    out = tool.invoke({"code": "print('a" + "\\n" + "b')"})
+    assert out.splitlines()[:4] == ["exit_code: 0", "stdout:", "a", "b"]
+
+
 def test_output_flood_is_killed_by_size_poll(ws: FakeWorkspace) -> None:
     code = "import time\nwhile True:\n    print('y' * 65536)\n    time.sleep(0.001)\n"
     started = time.monotonic()

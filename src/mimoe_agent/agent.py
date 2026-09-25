@@ -60,7 +60,9 @@ def system_prompt(settings: Settings, pre: Preflight) -> str:
     soft switch (``pre.thinking_control == "soft"``).
     """
     template = SYSTEM_PROMPT if pre.tools_enabled else SYSTEM_PROMPT_CHAT_ONLY
-    text = template.replace("{workspace}", str(settings.workspace))
+    # Forward slashes even on Windows (they work there): a backslashed path in the prompt made
+    # qwen3-4b write code with literal "\\n" sequences instead of line breaks.
+    text = template.replace("{workspace}", settings.workspace.as_posix())
     if pre.thinking_control == "soft" and not settings.think:
         text = f"{NO_THINK}\n{text}"
     return text

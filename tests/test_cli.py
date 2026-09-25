@@ -463,6 +463,60 @@ def test_answers_and_tool_results_cannot_send_terminal_sequences(
     assert "\\u202ereversed" in result.output
 
 
+def test_real_ctrl_c_returns_at_once_while_the_engine_is_still_reading_the_prompt(
+    run: Run, fake_mimoe: FakeMimoe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CPU-only engine can take seconds before its first chunk; Ctrl-C must not wait for it.
+    The prompt comes back within the grace period, the next message waits for the cancelled
+    call, and langchain-core's warning about the deliberate cancel is not printed."""
+    real_handler = fake_mimoe.handler
+    stalled = _slow_answer(words=3, delay=4.0)  # the first chunk arrives after 4 s
+    seen: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/chat/completions"):
+            body = json.loads(request.content)
+            if body.get("stream") and body["messages"][-1]["content"].startswith("slow"):
+                threading.Timer(
+                    1.0,
+                    lambda: (seen.setdefault("ctrl_c", time.monotonic()), _thread.interrupt_main()),
+                ).start()
+                return httpx.Response(
+                    200, headers={"content-type": "text/event-stream"}, stream=stalled
+                )
+        return real_handler(request)
+
+    real_cancel_turn = Session.cancel_turn
+
+    def timed_cancel_turn(self: Session) -> None:
+        seen["cancelled"] = time.monotonic()
+        real_cancel_turn(self)
+
+    monkeypatch.setattr(fake_mimoe, "handler", handler)
+    monkeypatch.setattr(Session, "cancel_turn", timed_cancel_turn)
+    script(fake_mimoe, {"content": "Still here."})
+    result = run(input="slow question" + "\n" + "hi" + "\n" + "/quit" + "\n")
+    assert result.exit_code == 0, result.output
+    assert seen["cancelled"] - seen["ctrl_c"] < 2.5, "the prompt waited for the stalled engine"
+    assert "turn cancelled" in result.output and "Still here." in result.output
+    assert "Error in" not in result.output and "TurnCancelled" not in result.output
+
+
+def test_models_table_fits_an_80_column_console(fake_mimoe: FakeMimoe) -> None:
+    """80 columns is rich's width when stdout is not a terminal (a pipe, CI, some Windows
+    consoles): model ids and the default's star must not be cut."""
+    client = MimoeClient(fake_mimoe.base_url, "1234", client=fake_mimoe.client())
+    client.discover()
+    console = Console(file=io.StringIO(), width=80)
+    console.print(
+        cli.models_table(client.engine, client.loaded_models(), client.registry_models(), width=80)
+    )
+    out = console.file.getvalue()  # type: ignore[attr-defined]
+    assert f"{DEFAULT_PRESET} *" in out
+    assert "…" not in out
+    assert max(len(line) for line in out.splitlines()) <= 80
+
+
 def test_ctrl_c_at_the_prompt_exits_130(
     run: Run, fake_mimoe: FakeMimoe, monkeypatch: pytest.MonkeyPatch
 ) -> None:

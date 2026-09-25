@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import logging
 import queue
 import re
 import sys
@@ -120,10 +121,27 @@ def _safe_value(value: Any) -> Any:
     return value
 
 
+NARROW_TABLE_WIDTH = 110
+"""Console width below which ``models list`` moves its notes under the table."""
 TURN_POLL_S = 0.1
 """How often the REPL thread wakes while a turn runs; keeps Ctrl-C prompt on every OS."""
+CANCEL_GRACE_S = 1.0
+"""How long Ctrl-C waits for the cancelled turn before the prompt comes back. A model call ends
+at its next streamed chunk; on a CPU-only machine reading a long prompt that can take seconds,
+so the rest happens in the background and the next message waits for it."""
 CANCEL_WAIT_S = 15.0
-"""How long Ctrl-C waits for a cancelled turn to wind down before moving to a new thread."""
+"""How long the next message waits for a cancelled turn before moving to a new thread."""
+
+
+class _HideCancelWarnings(logging.Filter):
+    """langchain-core logs a warning before it re-raises a callback's exception; for the
+    deliberate ``TurnCancelled`` that is noise in the terminal."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "TurnCancelled" not in record.getMessage()
+
+
+logging.getLogger("langchain_core.callbacks.manager").addFilter(_HideCancelWarnings())
 
 
 class TurnCancelled(Exception):
@@ -286,7 +304,9 @@ def models_list(ctx: typer.Context) -> None:
     _reconfigure_streams()
     client = _connect(_settings_or_exit(_overrides(ctx), need_workspace=False))
     try:
-        table = models_table(client.engine, client.loaded_models(), client.registry_models())
+        table = models_table(
+            client.engine, client.loaded_models(), client.registry_models(), width=console.width
+        )
     except MimoeError as exc:
         _fail(exc.message, exc.hint)
     console.print(table)
@@ -654,6 +674,9 @@ class Session:
     thread_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     agent: Any = None
     checkpointer: Any = None
+    _pending: threading.Thread | None = None
+    """A cancelled turn's worker that was still winding down when the prompt came back."""
+    _repair_after_pending: bool = False
 
     @property
     def run_config(self) -> dict[str, Any]:
@@ -788,6 +811,7 @@ class Session:
         """
         from mimoe_agent import stream as stream_module
 
+        self._settle_pending()
         renderer = Renderer(
             self.console, stats, verbose=self.verbose, show_thinking=self.settings.think
         )
@@ -831,25 +855,51 @@ class Session:
         return renderer
 
     def _abort_turn(self, worker: threading.Thread, cancel: threading.Event) -> None:
-        """Signal the cancel and wait (briefly, interruptibly) for the worker to wind down.
+        """Signal the cancel and give the worker CANCEL_GRACE_S to wind down.
 
-        A turn that is still running after CANCEL_WAIT_S (or after a second Ctrl-C) is left to
-        finish in the background; the session moves to a new thread so the two never share one.
+        The snippet is killed and the model stream ends at its next chunk; a worker still busy
+        after the grace period (a CPU-only machine reading a long prompt sends no chunk for a
+        while) is kept in ``_pending`` and settled before the next graph run.
         """
         cancel.set()
-        deadline = time.monotonic() + CANCEL_WAIT_S
+        deadline = time.monotonic() + CANCEL_GRACE_S
         with contextlib.suppress(KeyboardInterrupt):
             while worker.is_alive() and time.monotonic() < deadline:
                 worker.join(TURN_POLL_S)
         if worker.is_alive():
+            self._pending = worker
+
+    def _settle_pending(self) -> None:
+        """Wait for a cancelled turn that was still winding down, then mend its thread.
+
+        Two runs must never share a thread. If the old one is not done after CANCEL_WAIT_S (or on
+        Ctrl-C), the session moves to a new conversation and leaves it to finish on its own.
+        """
+        worker, self._pending = self._pending, None
+        if worker is None:
+            return
+        if worker.is_alive():
+            deadline = time.monotonic() + CANCEL_WAIT_S
+            with (
+                contextlib.suppress(KeyboardInterrupt),
+                self.console.status(
+                    Text("finishing the cancelled turn", style="dim"), spinner=SPINNER
+                ),
+            ):
+                while worker.is_alive() and time.monotonic() < deadline:
+                    worker.join(TURN_POLL_S)
+        repair, self._repair_after_pending = self._repair_after_pending, False
+        if worker.is_alive():
             self.thread_id = uuid.uuid4().hex
             self.console.print(
                 Text(
-                    "the cancelled turn is still finishing in the background; "
+                    "the cancelled turn is still running in the background; "
                     "continuing in a new conversation",
                     style="yellow",
                 )
             )
+        elif repair:
+            self._repair_thread()
 
     def ask_decisions(self, approval: Mapping[str, Any], attempt: int) -> list[dict[str, str]]:
         """Show every action request and collect one approve/reject decision per request."""
@@ -925,6 +975,9 @@ class Session:
         """After Ctrl-C mid-turn: say so and mend a tool call the cancel left without a result."""
         self.console.print()
         self.console.print(Text("turn cancelled", style="yellow"))
+        if self._pending is not None and self._pending.is_alive():
+            self._repair_after_pending = True  # mended once the worker is done
+            return
         self._repair_thread()
 
     def _repair_thread(self) -> None:
@@ -971,6 +1024,7 @@ class Session:
 
     def switch(self, model_id: str, *, keep_loaded: bool) -> None:
         """``/model``: load another model, re-run the preflight probe and rebuild the agent."""
+        self._settle_pending()
         previous = self.pre.model.id
         switched = False
         try:
@@ -1043,6 +1097,7 @@ class Session:
                 self.client.loaded_models(),
                 self.client.registry_models(),
                 tools_known={self.pre.model.id: self.pre.tools_enabled},
+                width=self.console.width,
             )
         except MimoeError as exc:
             print_failure(self.console, exc.message, exc.hint)
@@ -1134,8 +1189,15 @@ def models_table(
     registry: Sequence[RegistryModel],
     *,
     tools_known: Mapping[str, bool] | None = None,
+    width: int | None = None,
 ) -> Table:
-    """Registry, loaded models and presets in one table; ``*`` marks the recommended default."""
+    """Registry, loaded models and presets in one table; ``*`` marks the recommended default.
+
+    Below NARROW_TABLE_WIDTH columns (80 is rich's width when stdout is not a terminal) the
+    thinking and notes columns move out and the notes are listed under the table, so the model
+    ids are never cut.
+    """
+    narrow = width is not None and width < NARROW_TABLE_WIDTH
     loaded_by_id = {m.id: m for m in loaded}
     registry_by_id = {m.id: m for m in registry}
     ids = [m.id for m in registry]
@@ -1145,9 +1207,15 @@ def models_table(
         title=f"models on {engine.base_url} ({engine.generation}-generation engine)",
         title_justify="left",
     )
-    for column in ("model", "size", "state", "context", "tok/s", "tools", "thinking"):
+    label_width = max((len(i) + 2 for i in ids), default=5)
+    table.add_column("model", no_wrap=True, min_width=label_width)
+    for column in ("size", "state", "context", "tok/s", "tools") + (
+        () if narrow else ("thinking",)
+    ):
         table.add_column(column, no_wrap=True)
-    table.add_column("notes", overflow="fold")
+    if not narrow:
+        table.add_column("notes", overflow="fold")
+    notes_below: list[str] = []
     for model_id in ids:
         entry, live = registry_by_id.get(model_id), loaded_by_id.get(model_id)
         preset = preset_by_id(model_id)
@@ -1175,21 +1243,30 @@ def models_table(
                 notes.append("does not load on this engine")
         if entry is not None and entry.raw.get("statusMessage"):
             notes.append(str(entry.raw["statusMessage"]))
-        table.add_row(
+        cells = [
             f"{model_id} *" if model_id == DEFAULT_PRESET else model_id,
             f"{size_bytes / 1e9:.1f} GB" if size_bytes else "?",
             state,
             context,
             f"{live.tokens_per_second:.1f}" if live and live.tokens_per_second else "-",
             _yes_no(tools),
-            _yes_no(live.thinking_supported if live is not None else None),
-            "; ".join(notes),
-        )
+        ]
+        if narrow:
+            if notes:
+                notes_below.append(f"{model_id}: {'; '.join(notes)}")
+        else:
+            cells += [
+                _yes_no(live.thinking_supported if live is not None else None),
+                "; ".join(notes),
+            ]
+        table.add_row(*cells)
     table.caption = (
         "* recommended default. tools/thinking: from the engine's capability list on 1.0 "
         "engines, from the start-up probe on 0.6 engines, ? when unknown. "
         "`mimoe-agent models pull ID` downloads a preset, `models use ID` loads it."
     )
+    if notes_below:
+        table.caption += "\n\n" + "\n".join(notes_below)
     table.caption_justify = "left"
     return table
 
