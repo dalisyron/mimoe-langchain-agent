@@ -135,7 +135,7 @@ def test_think_soft_control_never_sends_enable_thinking(
 def test_system_prompt_variants(settings_tmp: Settings, preflight_fake: Preflight) -> None:
     soft = system_prompt(settings_tmp, preflight_fake)  # 0.6: soft control, thinking off
     assert soft.startswith("/no_think\n")
-    assert str(settings_tmp.workspace) in soft and "{workspace}" not in soft
+    assert settings_tmp.workspace.as_posix() in soft and "{workspace}" not in soft
     assert soft.removeprefix("/no_think\n") == SYSTEM_PROMPT.replace(
         "{workspace}", str(settings_tmp.workspace)
     )
