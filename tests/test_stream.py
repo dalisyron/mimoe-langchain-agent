@@ -711,7 +711,7 @@ def test_error_from_mimoe_500_body(fake_mimoe: FakeMimoe, workspace_tmp: Path, r
     assert events == [
         {
             "event": "error",
-            "message": "the conversation exceeded the model's context window",
+            "message": "the conversation exceeded the model's context window (llama_decode failed)",
             "hint": HINT_CONTEXT,
         }
     ]

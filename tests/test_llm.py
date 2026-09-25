@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import dataclasses
+import json as _json
 from pathlib import Path
 
+import httpx
 import pytest
 from conftest import FakeMimoe
 from langchain_core.messages import AIMessage, HumanMessage
@@ -246,3 +248,44 @@ def test_reasoning_content_is_never_sent_back(llm_fake: ChatOpenAI) -> None:
     ]
     assistant = llm_fake._get_request_payload(history)["messages"][1]
     assert assistant == {"role": "assistant", "content": "four"}
+
+
+def _cut_stream_client() -> httpx.Client:
+    """An engine that streams two chunks and then ends without a finish_reason (what 0.6.5 does
+    when llama_decode fails mid-answer)."""
+
+    def chunk(delta: dict) -> str:
+        body = {
+            "id": "cut",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "qwen3-4b",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        }
+        return f"data: {_json.dumps(body)}\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        text = chunk({"role": "assistant"}) + chunk({"content": "The answer is"})
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=text)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_a_stream_cut_without_finish_reason_raises_a_clear_error(
+    fake_mimoe: FakeMimoe, settings_tmp: Settings
+) -> None:
+    from mimoe_agent.mimoe import HINT_STREAM_CUT, MimoeError
+
+    _, pre = _build(fake_mimoe, settings_tmp)
+    llm = make_model(settings_tmp, pre, http_client=_cut_stream_client())
+    with pytest.raises(MimoeError, match="stopped in the middle of the answer") as info:
+        list(llm.stream("hi"))
+    assert info.value.hint == HINT_STREAM_CUT
+
+
+def test_a_complete_stream_is_not_mistaken_for_a_cut(
+    fake_mimoe: FakeMimoe, settings_tmp: Settings
+) -> None:
+    llm, _ = _build(fake_mimoe, settings_tmp)
+    chunks = list(llm.stream("hi"))
+    assert "".join(str(c.content) for c in chunks).strip()

@@ -346,6 +346,14 @@ def switch_model(
             (its hint names the models that were already unloaded).
     """
     model_id = strip_node_prefix(model_id)
+    if model_id in V10_ONLY_PRESETS and client.discover().generation is EngineGeneration.V06:
+        # Checked before anything is unloaded: the switch would otherwise leave no model at all.
+        raise MimoeError(
+            f"{model_id} needs a newer mimOE engine (Studio 1.0 or later); this 0.6-generation "
+            "engine cannot load its architecture",
+            hint="Keep the current model, pick another preset (`mimoe-agent models list`), or "
+            "update mimOE Studio.",
+        )
     loaded = client.loaded_models()
     current = next((m for m in loaded if m.id == model_id), None)
     if current is None:

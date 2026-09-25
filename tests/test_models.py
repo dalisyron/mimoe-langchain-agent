@@ -552,13 +552,26 @@ def test_switch_model_warns_about_big_models(fake_mimoe: FakeMimoe) -> None:
     assert statuses[0] == (
         "warning: qwen3-8b is about 7 GB at 12k context; tight on a 16 GB machine"
     )
-    fake_mimoe.registry.append("qwen3.5-9b")
-    fake_mimoe.registry_sizes["qwen3.5-9b"] = None  # linked by local path: preset size instead
+    fake_v10 = FakeMimoe("1.0")  # qwen3.5 presets only load on 1.0-generation engines
+    fake_v10.registry.append("qwen3.5-9b")
+    fake_v10.registry_sizes["qwen3.5-9b"] = None  # linked by local path: preset size instead
     statuses.clear()
-    switch_model(
-        _client(fake_mimoe), "qwen3.5-9b", unload_previous=False, on_status=statuses.append
-    )
+    switch_model(_client(fake_v10), "qwen3.5-9b", unload_previous=False, on_status=statuses.append)
     assert statuses[0].startswith("warning: qwen3.5-9b is about 7 GB")
+
+
+def test_switch_to_a_v10_only_preset_on_a_v06_engine_refuses_before_unloading(
+    fake_mimoe: FakeMimoe,
+) -> None:
+    """The 0.6 engine cannot load qwen3.5; unloading the working model first would leave none."""
+    fake_mimoe.registry.append("qwen3.5-4b")
+    statuses: list[str] = []
+    with pytest.raises(MimoeError, match="needs a newer mimOE engine"):
+        switch_model(
+            _client(fake_mimoe), "qwen3.5-4b", unload_previous=True, on_status=statuses.append
+        )
+    assert statuses == []
+    assert [m.id for m in _client(fake_mimoe).loaded_models()] == ["qwen3-4b"]
 
 
 def test_switch_model_load_failure_names_the_unloaded_model(fake_mimoe: FakeMimoe) -> None:

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -38,9 +39,13 @@ import openai
 from mimoe_agent.config import ConfigError, Settings
 
 CANDIDATE_BASE_URLS = (
+    "http://127.0.0.1:8083/mimik-ai/openai/v1",
+    "http://127.0.0.1:8083/openai/v1",
     "http://localhost:8083/mimik-ai/openai/v1",
-    "http://localhost:8083/openai/v1",
 )
+"""Tried in order when no base URL is configured. The IPv4 loopback comes first: ``localhost``
+resolves to ``::1`` first, and Windows spends about two seconds on every refused connection
+there before it tries ``127.0.0.1`` (mimOE listens on IPv4)."""
 
 GET_TIMEOUT_S = 5.0
 RPC_TIMEOUT_S = 3.0
@@ -51,8 +56,11 @@ UNLOAD_TIMEOUT_S = 60.0
 PROBE_MAX_TOKENS = 48
 V10_MIN_VERSION = (3, 30)
 
+_STUDIO_ICON = "system-tray icon" if sys.platform == "win32" else "menu-bar icon"
+_ENGINE_DIR = r"%USERPROFILE%\.mimoe" if sys.platform == "win32" else "~/.mimoe"
+
 HINT_NOT_REACHABLE = (
-    "Open mimOE Studio (menu-bar icon) and wait for the status dot to turn green, then retry; "
+    f"Open mimOE Studio ({_STUDIO_ICON}) and wait for the status dot to turn green, then retry; "
     "if Studio listens on another port pass --base-url http://localhost:PORT/mimik-ai/openai/v1."
 )
 HINT_NO_MODEL = "Studio > Models > Load a chat model (for example qwen3-4b), then run again."
@@ -60,7 +68,15 @@ HINT_API_KEY = (
     "Studio shows the API key under the API button (default 1234); "
     "pass --api-key KEY or set MIMOE_API_KEY."
 )
-HINT_CONTEXT = "Start a new conversation with /new (web UI: New conversation)."
+HINT_CONTEXT = (
+    "Start a new conversation with /new (web UI: New conversation). If it happens early in a "
+    "conversation, the engine is short of memory: close other apps or load a smaller model."
+)
+HINT_STREAM_CUT = (
+    "The conversation may have outgrown the model's context window: start a new one with /new "
+    "(web UI: New conversation). If it keeps happening, the engine may be out of memory: close "
+    "other apps or load a smaller model."
+)
 HINT_WRONG_PATH = (
     "Use --base-url http://localhost:8083/mimik-ai/openai/v1 "
     "(older builds: http://localhost:8083/openai/v1)."
@@ -69,7 +85,8 @@ HINT_MODEL_NOT_READY = (
     "The model is registered but its file is missing; Studio > Models > Download it first."
 )
 HINT_SERVER_ERROR = (
-    "Studio > Models: reload the model if it crashed, then retry; the engine log is under ~/.mimoe."
+    "Studio > Models: reload the model if it crashed, then retry; the engine log is under "
+    f"{_ENGINE_DIR}."
 )
 HINT_TIMEOUT = "The model may be busy or still loading; wait a moment and retry."
 HINT_PROBE_FAILED = (
@@ -214,6 +231,24 @@ def detect_generation(
     if parsed is not None and parsed >= V10_MIN_VERSION:
         return EngineGeneration.V10
     return EngineGeneration.V06
+
+
+def is_remote(model: LoadedModel) -> bool:
+    """True for ``GET /models`` entries that mimOE does not run on this machine.
+
+    0.6 engines list a configured cloud model as ``owned_by: "cloud"``; 1.0 engines list
+    provider models (Ollama, cloud APIs) with ``owned_by: "provider:<id>"``, ``attached: true``
+    and ``info.cloud``. Prompts sent to those leave the machine, so they are never auto-picked.
+    """
+    raw = model.raw
+    owner = str(raw.get("owned_by") or "").lower()
+    info = raw.get("info") if isinstance(raw.get("info"), Mapping) else {}
+    return (
+        owner == "cloud"
+        or owner.startswith("provider")
+        or bool(raw.get("attached"))
+        or bool(info.get("cloud"))
+    )
 
 
 def parse_loaded_model(entry: Mapping[str, Any], node_id: str | None = None) -> LoadedModel:
@@ -686,10 +721,18 @@ def preflight(
     notify("connecting to mimOE Studio")
     engine = client.discover()
     models = client.loaded_models()
-    if not models:
-        raise MimoeError("no model is loaded", hint=HINT_NO_MODEL)
-    model = _pick_model(models, settings.model)
+    local = [m for m in models if not is_remote(m)]
+    if not local and not settings.model:
+        remote = ", ".join(m.id for m in models)
+        detail = f" (only remote models are listed: {remote})" if remote else ""
+        raise MimoeError(f"no model is loaded{detail}", hint=HINT_NO_MODEL)
+    model = _pick_model(models if settings.model else local, settings.model)
     warnings: list[str] = []
+    if is_remote(model):
+        warnings.append(
+            f"{model.id} is served by a remote provider, not by mimOE on this machine: your "
+            "prompts and workspace contents leave this computer"
+        )
     if engine.version is None:
         warnings.append("node info unavailable (JSON-RPC getMe failed); engine version unknown")
 
@@ -741,6 +784,8 @@ def friendly_error(exc: BaseException) -> tuple[str, str]:
     if isinstance(exc, MimoeError | ConfigError):
         return exc.message, exc.hint
     names = {cls.__name__ for cls in type(exc).__mro__}
+    if "TurnCancelled" in names:
+        return "turn cancelled", "Send a new message when you are ready."
     if isinstance(exc, httpx.TimeoutException | openai.APITimeoutError) or (
         "ModelTimeoutError" in names
     ):
@@ -761,7 +806,9 @@ def friendly_error(exc: BaseException) -> tuple[str, str]:
             "Studio > Models > Load the model, or pass --model with a loaded id.",
         )
     if "ContextOverflowError" in names or "llama_decode" in text:
-        return "the conversation exceeded the model's context window", HINT_CONTEXT
+        return "the conversation exceeded the model's context window (llama_decode failed)", (
+            HINT_CONTEXT
+        )
     if status == 503 and not text.strip():
         return "mimOE answered 503 with an empty body: the base URL path is wrong", HINT_WRONG_PATH
     if status == 400 and "not ready" in text.lower():
@@ -896,7 +943,10 @@ def _status_error(status: int, body: object, *, url: str) -> MimoeError:
     if status == 400 and "not ready" in message.lower():
         return MimoeError(f"the model is not ready ({message})", hint=HINT_MODEL_NOT_READY)
     if status >= 500 and "llama_decode" in text:
-        return MimoeError("the conversation exceeded the model's context window", hint=HINT_CONTEXT)
+        return MimoeError(
+            "the conversation exceeded the model's context window (llama_decode failed)",
+            hint=HINT_CONTEXT,
+        )
     if status == 503 and not text.strip():
         return MimoeError(
             f"mimOE answered 503 with an empty body for {url}: the base URL path is wrong",
@@ -910,6 +960,9 @@ def _status_of(exc: BaseException) -> tuple[int | None, object]:
     """Return ``(status_code, body)`` for SDK/httpx status errors, ``(None, None)`` otherwise."""
     if isinstance(exc, openai.APIStatusError):
         return exc.status_code, exc.body
+    if isinstance(exc, openai.APIError):  # an error event inside a stream (1.0 engines)
+        body = exc.body
+        return (_body_status(body) if isinstance(body, Mapping) else None), body
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code, _parse_body(exc.response)
     status = getattr(exc, "status_code", None)

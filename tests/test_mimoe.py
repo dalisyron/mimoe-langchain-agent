@@ -25,6 +25,7 @@ from mimoe_agent.mimoe import (
     MimoeClient,
     MimoeError,
     Preflight,
+    ProbeResult,
     derive_urls,
     detect_generation,
     friendly_error,
@@ -177,9 +178,9 @@ def test_discover_falls_back_to_candidates(fake_mimoe: FakeMimoe) -> None:
     client = MimoeClient(None, "1234", client=fake_mimoe.client())
     engine = client.discover()
     assert engine.base_url == CANDIDATE_BASE_URLS[1]
-    assert engine.store_url == "http://localhost:8083/store/v1"
+    assert engine.store_url == "http://127.0.0.1:8083/store/v1"
     tried = [str(r.url) for r in fake_mimoe.requests if r.url.path.endswith("/models")]
-    assert tried == [c + "/models" for c in CANDIDATE_BASE_URLS]
+    assert tried == [c + "/models" for c in CANDIDATE_BASE_URLS[:2]]  # found at the second
 
 
 def test_discover_unreachable_lists_urls(fake_mimoe: FakeMimoe) -> None:
@@ -199,16 +200,22 @@ def test_discover_unreachable_lists_urls(fake_mimoe: FakeMimoe) -> None:
 def test_discover_explicit_url_never_falls_back(fake_mimoe: FakeMimoe) -> None:
     """An explicit --base-url that is down must not silently connect to another engine."""
 
-    def only_localhost(request: httpx.Request) -> httpx.Response:
-        if request.url.host != "localhost":
+    def only_port_8083(request: httpx.Request) -> httpx.Response:
+        if request.url.port != 8083:
             raise httpx.ConnectError("Connection refused", request=request)
         return fake_mimoe.handler(request)
 
-    http = httpx.Client(transport=httpx.MockTransport(only_localhost))
+    http = httpx.Client(transport=httpx.MockTransport(only_port_8083))
     with pytest.raises(MimoeError, match="not reachable"):
         MimoeClient("http://127.0.0.1:8093/mimik-ai/openai/v1", "1234", client=http).discover()
-    assert fake_mimoe.requests == []  # the candidates on localhost were never tried
+    assert fake_mimoe.requests == []  # the default candidates on port 8083 were never tried
     assert MimoeClient(None, "1234", client=http).discover().base_url == CANDIDATE_BASE_URLS[0]
+
+
+def test_discover_prefers_the_ipv4_loopback() -> None:
+    """localhost resolves to ::1 first; Windows spends ~2 s per refused connect there."""
+    assert CANDIDATE_BASE_URLS[0].startswith("http://127.0.0.1:8083/")
+    assert CANDIDATE_BASE_URLS[-1].startswith("http://localhost:8083/")  # IPv6-only engines
 
 
 def test_discover_rejects_non_model_list(fake_mimoe: FakeMimoe) -> None:
@@ -761,3 +768,60 @@ def test_friendly_error_generic() -> None:
     assert hint
     msg, _ = friendly_error(openai.OpenAIError("missing credentials"))
     assert msg.startswith("model error:")
+
+
+# -- remote (cloud / provider) entries -----------------------------------------------------------
+
+_CLOUD_06 = {"id": "gpt-4o-mini", "object": "model", "owned_by": "cloud", "info": {"kind": "llm"}}
+_PROVIDER_10 = {
+    "id": "ollama/llama3.2:3b",
+    "object": "model",
+    "owned_by": "provider:ollama",
+    "attached": True,
+    "info": {"kind": "llm", "cloud": False},
+}
+
+
+def test_is_remote_recognises_cloud_and_provider_entries(fake_mimoe: FakeMimoe) -> None:
+    from mimoe_agent.mimoe import is_remote, parse_loaded_model
+
+    assert is_remote(parse_loaded_model(_CLOUD_06))
+    assert is_remote(parse_loaded_model(_PROVIDER_10))
+    assert not any(is_remote(m) for m in _client(fake_mimoe).loaded_models())
+
+
+def test_preflight_never_auto_picks_a_remote_model(
+    fake_mimoe: FakeMimoe, workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Studio lists cloud/provider models next to local ones; "nothing leaves your machine"
+    only holds if the agent never picks one on its own."""
+    from mimoe_agent.mimoe import parse_loaded_model
+
+    client = _client(fake_mimoe)
+    local = client.loaded_models()
+    remote = [parse_loaded_model(_CLOUD_06), parse_loaded_model(_PROVIDER_10)]
+    monkeypatch.setattr(client, "loaded_models", lambda: [*remote, *local])
+    pre = preflight(_settings(workspace_tmp), client=client)
+    assert pre.model.id == "qwen3-4b"
+
+    monkeypatch.setattr(client, "loaded_models", lambda: remote)
+    with pytest.raises(MimoeError, match="only remote models are listed: gpt-4o-mini"):
+        preflight(_settings(workspace_tmp), client=client)
+
+
+def test_an_explicitly_chosen_remote_model_comes_with_a_warning(
+    fake_mimoe: FakeMimoe, workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mimoe_agent.mimoe import parse_loaded_model
+
+    client = _client(fake_mimoe)
+    local = client.loaded_models()
+    monkeypatch.setattr(client, "loaded_models", lambda: [parse_loaded_model(_CLOUD_06), *local])
+    monkeypatch.setattr(
+        client,
+        "probe_tools",
+        lambda *a, **k: ProbeResult(tools_ok=True, latency_s=0.1, detail="ok"),
+    )
+    pre = preflight(_settings(workspace_tmp, model="gpt-4o-mini"), client=client)
+    assert pre.model.id == "gpt-4o-mini"
+    assert any("leave this computer" in w for w in pre.warnings)

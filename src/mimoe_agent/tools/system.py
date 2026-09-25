@@ -731,9 +731,7 @@ def _describe_model(model: Any) -> str:
     if thinking is False:
         details.append("thinking: not supported")
     elif thinking:
-        can_disable = getattr(model, "thinking_can_disable", None)
-        suffix = {True: " (can be disabled)", False: " (always on)"}.get(can_disable, "")
-        details.append(f"thinking: supported{suffix}")
+        details.append("thinking: supported (the assistant keeps it off unless --think)")
     return f"{head}: {', '.join(details)}"
 
 

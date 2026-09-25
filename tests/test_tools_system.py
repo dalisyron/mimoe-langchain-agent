@@ -772,7 +772,10 @@ def test_mimoe_status_v10_capabilities_and_prefixed_id() -> None:
     out = mimoe_status_report(client)
     assert "(1.0-era engine)" in out
     assert "- qwen3.5-4b (llm, qwen35 family): 4.0B params, max context 12000 tokens, " in out
-    assert "35.4 tokens/s, tool calling: yes, thinking: supported (always on)" in out
+    assert (
+        "35.4 tokens/s, tool calling: yes, "
+        "thinking: supported (the assistant keeps it off unless --think)" in out
+    )
     assert " GB" not in out  # no size in raw -> no size claim
 
 

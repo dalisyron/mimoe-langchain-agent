@@ -12,7 +12,7 @@ langchain-openai also never reads ``reasoning_content`` (its class docstring say
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from typing import Any
 
 import httpx
@@ -21,7 +21,7 @@ from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_openai import ChatOpenAI
 
 from mimoe_agent.config import Settings
-from mimoe_agent.mimoe import Preflight
+from mimoe_agent.mimoe import HINT_STREAM_CUT, MimoeError, Preflight
 
 MAX_TOKENS = 1024
 MAX_TOKENS_THINK = 4096
@@ -81,6 +81,30 @@ class MimoeChatOpenAI(ChatOpenAI):
             generation.message.additional_kwargs[REASONING_KEY] = reasoning
         return generation
 
+    def _stream(self, *args: Any, **kwargs: Any) -> Iterator[ChatGenerationChunk]:
+        """``ChatOpenAI._stream`` that fails loudly when the engine ends the stream early.
+
+        Every complete completion ends with a chunk carrying ``finish_reason``. mimOE 0.6.5
+        reports an error in the middle of a stream (the context filled up, the model crashed)
+        without the SSE framing the client expects, so the stream just stops and the turn would
+        end with a cut-off or empty answer and no explanation.
+        """
+        finished = False
+        for chunk in super()._stream(*args, **kwargs):
+            finished = finished or _finished(chunk)
+            yield chunk
+        if not finished:
+            raise _stream_cut()
+
+    async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[ChatGenerationChunk]:
+        """Async twin of :meth:`_stream`."""
+        finished = False
+        async for chunk in super()._astream(*args, **kwargs):
+            finished = finished or _finished(chunk)
+            yield chunk
+        if not finished:
+            raise _stream_cut()
+
     def _create_chat_result(
         self,
         response: dict | openai.BaseModel,
@@ -93,6 +117,18 @@ class MimoeChatOpenAI(ChatOpenAI):
             if reasoning:
                 generation.message.additional_kwargs[REASONING_KEY] = reasoning
         return result
+
+
+def _finished(chunk: ChatGenerationChunk) -> bool:
+    info = chunk.generation_info or {}
+    return bool(info.get("finish_reason") or chunk.message.response_metadata.get("finish_reason"))
+
+
+def _stream_cut() -> MimoeError:
+    return MimoeError(
+        "mimOE stopped in the middle of the answer (the stream ended without a finish reason)",
+        hint=HINT_STREAM_CUT,
+    )
 
 
 def make_model(
