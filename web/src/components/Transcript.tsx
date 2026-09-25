@@ -7,7 +7,7 @@ import { ToolCard } from './ToolCard';
 const DEMO_PROMPTS = [
   'What files are in this workspace?',
   'Summarize notes.md',
-  'How many rows does sales.csv have, and what is the total revenue?',
+  'Use run_python to count the data rows of sales.csv and sum its revenue column.',
   'Find every TODO in this workspace and tell me where they are.',
   'What model am I talking to, and how fast is it?',
 ];
