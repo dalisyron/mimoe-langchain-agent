@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Action } from './events';
-import { initialState, reducer, type AssistantTurn, type ChatState } from './reducer';
+import { RUN_ENDED, initialState, reducer, type AssistantTurn, type ChatState } from './reducer';
 
 const replay = (actions: Action[], state: ChatState = initialState('t1')) => actions.reduce(reducer, state);
 const assistant = (s: ChatState, i = 1): AssistantTurn => {
@@ -95,6 +95,32 @@ describe('reducer: approval flow', () => {
     expect(s3.streaming).toBe(false);
   });
 
+  it('the stats of a turn add up its runs: the chat that asked for approval plus the resume', () => {
+    const s = replay([
+      { type: 'decided', decisions: ['approve'] },
+      { type: 'tool_result', id: 'tool_0', name: 'run_python', content: '1', is_error: false },
+      { type: 'token', text: 'It prints 1.' },
+      { type: 'done', status: 'completed', elapsed_s: 1.5, model: 'qwen3-4b', usage_total: { input_tokens: 100, output_tokens: 20, llm_calls: 1 } },
+    ], replay(untilApproval));
+    expect(assistant(s).stats).toEqual({ elapsed_s: 4, model: 'qwen3-4b', usage: { input_tokens: 300, output_tokens: 50, llm_calls: 3 } });
+    // a run without usage keeps the numbers it has
+    const s2 = replay([{ type: 'done', status: 'completed', elapsed_s: 0.5, model: 'm2' }], { ...s, streaming: true });
+    expect(assistant(s2).stats).toEqual({ elapsed_s: 4.5, model: 'm2', usage: { input_tokens: 300, output_tokens: 50, llm_calls: 3 } });
+  });
+
+  it('a resume that fails (409 stale or nothing pending) marks the approved tool instead of leaving it running', () => {
+    const s = replay([
+      { type: 'decided', decisions: ['approve'] },
+      { type: 'stream_failed', message: 'HTTP 409: nothing to resume on this thread', hint: 'Send a message with POST /api/chat' },
+    ], replay(untilApproval));
+    expect(assistant(s).blocks).toEqual([
+      { kind: 'tool', id: 'tool_0', name: 'run_python', args: { code: 'print(1)' }, status: 'error', result: RUN_ENDED },
+      { kind: 'error', message: 'HTTP 409: nothing to resume on this thread', hint: 'Send a message with POST /api/chat' },
+    ]);
+    expect(s.streaming).toBe(false);
+    expect(s.approval).toBeNull();
+  });
+
   it('deny: the card stays denied even though the backend reports the rejection as an error result', () => {
     const s = replay([
       { type: 'decided', decisions: ['reject'] },
@@ -140,6 +166,16 @@ describe('reducer: errors, stop, reset', () => {
       { kind: 'text', text: 'partial' },
       { kind: 'error', message: 'mimOE returned 500', hint: 'start a new conversation' },
     ]);
+  });
+
+  it('an error event after a tool_call ends the tool card too: nothing will report back', () => {
+    const s = replay([
+      { type: 'send', text: 'go' },
+      { type: 'tool_call', id: 'tool_0', name: 'read_file', args: { path: 'notes.md' } },
+      { type: 'error', message: 'mimOE returned 500' },
+    ]);
+    expect(assistant(s).blocks[0]).toMatchObject({ kind: 'tool', status: 'error', result: RUN_ENDED });
+    expect(assistant(s).blocks[1]).toEqual({ kind: 'error', message: 'mimOE returned 500', hint: undefined });
   });
 
   it('an HTTP failure (409/422) shows as an error block in the turn it belongs to', () => {

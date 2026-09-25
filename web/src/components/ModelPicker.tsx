@@ -6,7 +6,8 @@ type Status = { kind: 'busy' | 'ok' | 'bad'; text: string };
 const gb = (bytes: number | null | undefined) => (bytes ? ` (${(bytes / 1e9).toFixed(1)} GB)` : '');
 
 /** Lists loaded and registry models; POST /api/model loads the chosen one and re-runs the tool probe. */
-export function ModelPicker({ current, disabled, onSwitching, onSwitched }: {
+export function ModelPicker({ enabled, current, disabled, onSwitching, onSwitched }: {
+  enabled: boolean; // the health badge answered (also when no model is loaded: the registry can still be loaded from here)
   current: string | null;
   disabled: boolean;
   onSwitching: (inFlight: boolean) => void; // App disables the composer meanwhile
@@ -18,11 +19,13 @@ export function ModelPicker({ current, disabled, onSwitching, onSwitched }: {
   const [status, setStatus] = useState<Status | null>(null);
   const busy = status?.kind === 'busy';
 
+  // Fetched once the badge is known and again whenever the current model changes (a switch here or elsewhere).
   useEffect(() => {
+    if (!enabled) return;
     let alive = true;
     api.models().then((m) => alive && setModels(m)).catch(() => alive && setModels(null));
     return () => { alive = false; };
-  }, [current]);
+  }, [enabled, current]);
 
   if (!models) return null;
   const loaded = new Set(models.loaded.map((m) => m.id));

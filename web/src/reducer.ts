@@ -12,6 +12,8 @@ export type Block =
   | { kind: 'error'; message: string; hint?: string };
 
 export type Stats = { elapsed_s: number; model: string; usage?: Usage | null };
+/** Result shown on a tool card that was still running when its run ended without a result. */
+export const RUN_ENDED = 'no result: the run ended before the tool reported back';
 export type AssistantTurn = { role: 'assistant'; blocks: Block[]; stats?: Stats };
 export type Turn = { role: 'user'; text: string } | AssistantTurn;
 export type Approval = { interruptId: string; requests: ActionRequest[] };
@@ -51,6 +53,26 @@ function markAwaiting(blocks: Block[], requests: ActionRequest[]): Block[] {
   return out;
 }
 
+/** A turn's stats are the sum of its runs (the chat and the resumes that answered its approvals);
+ * the server's `done` reports each run on its own. The model is the one that spoke last. */
+function addStats(prev: Stats | undefined, done: { elapsed_s: number; model: string; usage_total?: Usage | null }): Stats {
+  const usage = done.usage_total ?? undefined;
+  if (!prev) return { elapsed_s: done.elapsed_s, model: done.model, usage };
+  const sum =
+    prev.usage && usage
+      ? {
+          input_tokens: prev.usage.input_tokens + usage.input_tokens,
+          output_tokens: prev.usage.output_tokens + usage.output_tokens,
+          llm_calls: prev.usage.llm_calls + usage.llm_calls,
+        }
+      : (usage ?? prev.usage);
+  return { elapsed_s: prev.elapsed_s + done.elapsed_s, model: done.model, usage: sum };
+}
+
+/** Tools still running when a run ends without their result cannot report back any more. */
+const endRunningTools = (blocks: Block[], result: string): Block[] =>
+  blocks.map((b) => (b.kind === 'tool' && b.status === 'running' ? { ...b, status: 'error' as const, result: b.result ?? result } : b));
+
 /** The k-th decision answers the k-th tool that is awaiting approval. */
 function applyDecisions(blocks: Block[], decisions: Decision[]): Block[] {
   let k = 0;
@@ -86,23 +108,17 @@ export function reducer(state: ChatState, action: Action): ChatState {
     case 'notice':
       return withBlocks(state, (b) => [...b, { kind: 'notice', text: action.text }]);
     case 'done':
-      return {
-        ...withTurn(state, (t) => ({ ...t, stats: { elapsed_s: action.elapsed_s, model: action.model, usage: action.usage_total } })),
-        streaming: false,
-      };
+      return { ...withTurn(state, (t) => ({ ...t, stats: addStats(t.stats, action) })), streaming: false };
     case 'error':
-    case 'stream_failed':
+    case 'stream_failed': // the run is over (also for a failed resume, whose tool was already marked running)
       return {
-        ...withBlocks(state, (b) => [...b, { kind: 'error', message: action.message, hint: action.hint ?? undefined }]),
+        ...withBlocks(state, (b) => [...endRunningTools(b, RUN_ENDED), { kind: 'error', message: action.message, hint: action.hint ?? undefined }]),
         streaming: false,
       };
     case 'stopped': // the fetch was aborted, so running tools cannot report back
       if (!state.streaming) return state;
       return {
-        ...withBlocks(state, (blocks) => [
-          ...blocks.map((b) => (b.kind === 'tool' && b.status === 'running' ? { ...b, status: 'error' as const, result: 'stopped' } : b)),
-          { kind: 'notice', text: 'Stopped.' },
-        ]),
+        ...withBlocks(state, (blocks) => [...endRunningTools(blocks, 'stopped'), { kind: 'notice', text: 'Stopped.' }]),
         streaming: false,
       };
     case 'reset':

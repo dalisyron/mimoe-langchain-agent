@@ -14,14 +14,17 @@ export default function App() {
   const [switching, setSwitching] = useState(false); // POST /api/model in flight: the agent is being rebuilt
   const busy = state.streaming || state.approval !== null || switching;
 
-  // Badge: poll every 10 s, and refresh right after a turn ends (tokens/s changes per inference).
+  // Badge: poll every 10 s, and refresh right after a turn ends (tokens/s changes per inference) or a model
+  // switch finishes. No polling during the switch: the picker shows its progress, and the server's health
+  // reports the engine as unreachable meanwhile, which would paint the dot red for a normal load.
   useEffect(() => {
+    if (switching) return;
     let alive = true;
     const refresh = () => api.health().then((h) => alive && setHealth(h)).catch(() => alive && setHealth(null));
     void refresh();
     const timer = setInterval(refresh, 10_000);
     return () => { alive = false; clearInterval(timer); };
-  }, [state.streaming, tick]);
+  }, [state.streaming, tick, switching]);
 
   return (
     <div className="app">

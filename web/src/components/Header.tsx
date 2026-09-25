@@ -38,7 +38,9 @@ export function Header({ health, busy, onNew, onSwitching, onSwitched }: {
             </>
           )}
         </div>
-        <ModelPicker current={health?.model ?? null} disabled={busy || !health} onSwitching={onSwitching} onSwitched={onSwitched} />
+      </div>
+      <div className="row controls">
+        <ModelPicker enabled={health !== undefined} current={health?.model ?? null} disabled={busy || !health} onSwitching={onSwitching} onSwitched={onSwitched} />
         <button type="button" onClick={onNew}>New conversation</button>
       </div>
       {health?.error && <div className="hint">{health.error}</div>}

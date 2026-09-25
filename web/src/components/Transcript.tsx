@@ -42,6 +42,8 @@ export function Transcript({ turns, streaming, disabled, onPrompt }: {
   );
 }
 
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
 function Assistant({ turn, live }: { turn: AssistantTurn; live: boolean }) {
   const last = turn.blocks.length - 1;
   const s = turn.stats;
@@ -59,7 +61,7 @@ function Assistant({ turn, live }: { turn: AssistantTurn; live: boolean }) {
       {live && <span className="cursor" />}
       {s && (
         <div className="stats">
-          {s.usage && `${s.usage.llm_calls} model calls · ${s.usage.output_tokens} tokens · `}{s.elapsed_s.toFixed(1)} s · {s.model}
+          {s.usage && `${plural(s.usage.llm_calls, 'model call')} · ${plural(s.usage.output_tokens, 'token')} · `}{s.elapsed_s.toFixed(1)} s · {s.model}
         </div>
       )}
     </div>
