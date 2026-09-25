@@ -1,0 +1,4 @@
+node_modules/
+# dist/ is committed on purpose (the Python server serves it); the root .gitignore's `dist/`
+# pattern would otherwise swallow it, so re-include it here.
+!dist/

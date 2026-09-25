@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
-dist/
+/dist/
 build/
 *.egg-info/
 # node (web/dist is committed on purpose)
