@@ -188,35 +188,37 @@ Two lines of LangGraph vocabulary, since `create_agent` compiles to a LangGraph 
 ## How the components connect
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph clients["Clients"]
-        CLI["cli.py: REPL (typer + rich)"]
-        UI["web/: React UI"]
+        CLI["cli.py: terminal REPL"]
+        UI["web/: React UI in the browser"]
     end
     API["server.py: FastAPI on 127.0.0.1:8000"]
     ST["stream.py: graph output to events"]
-    AG["agent.py: create_agent graph + middleware"]
-    CK[("InMemorySaver: one checkpoint per thread")]
+    subgraph AGENT["agent.py: create_agent graph"]
+        MW["middleware: Qwen cleanup, guardrails, 8-call limit, approval on run_python"]
+        CK[("InMemorySaver: one checkpoint per thread")]
+    end
     TOOLS["tools/: 8 tools"]
-    PY["child python: run_python"]
     WS[("workspace/")]
+    PY["child python for approved run_python code"]
     PRE["mimoe.py: discovery, preflight, model switch"]
-    EP["mimOE Studio: /mimik-ai/openai/v1 and /mimik-ai/store/v1"]
-    CLI -->|"messages or Command(resume)"| ST
-    UI -->|"POST /api/chat and /api/resume, JSON"| API
-    API -->|"SSE: token, tool_call, tool_result, approval_required, done, error"| UI
-    API -->|"messages or Command(resume)"| ST
-    ST -->|"agent.stream with stream_mode messages and updates"| AG
-    AG <-->|"state and the pending interrupt"| CK
-    AG -->|"POST /chat/completions: messages plus 8 tool schemas, stream"| EP
-    EP -->|"deltas, structured tool_calls, usage"| AG
-    AG -->|"tool_calls"| TOOLS
-    TOOLS -->|"ToolMessage, 8 KB cap"| AG
+    EP["mimOE Studio on localhost:8083"]
+
+    UI -->|"POST /api/chat and /api/resume"| API
+    API -->|"SSE: token, tool_call, tool_result, approval_required, done"| UI
+    CLI -->|"a message or an approval decision"| ST
+    API -->|"a message or an approval decision"| ST
+    ST -->|"agent.stream, modes messages and updates"| AGENT
+    AGENT -->|"POST chat/completions: messages plus 8 tool schemas"| EP
+    EP -->|"streamed tokens and structured tool_calls"| AGENT
+    AGENT -->|"tool_calls"| TOOLS
+    TOOLS -->|"ToolMessage, capped at 8 KB"| AGENT
     TOOLS -->|"read only, jailed"| WS
-    TOOLS -->|"code, cwd workspace, 30 s"| PY
-    CLI -->|"at start-up and on /model"| PRE
-    API -->|"at start-up and on POST /api/model"| PRE
-    PRE -->|"GET /models, getMe, one ping completion, load and unload"| EP
+    TOOLS -->|"code, 30 s limit"| PY
+    CLI -.->|"start-up and /model"| PRE
+    API -.->|"start-up and POST /api/model"| PRE
+    PRE -.->|"GET /models, getMe, ping probe, load and unload"| EP
 ```
 
 What each module does, in reading order:
