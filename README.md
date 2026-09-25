@@ -69,10 +69,10 @@ About 5 minutes, plus a 2.5 GB model download.
    ```bash
    uv run mimoe-agent
    ```
-   The agent finds the engine, picks the loaded model, runs one warm-up completion with a tiny
-   `ping` tool (that validates the API key, absorbs the cold start and tells it whether the model
-   can call tools), and prints a banner with the model, tokens/s, the workspace and the five demo
-   prompts. `/quit` exits.
+   The agent finds the engine, picks the loaded model and checks that it can call tools: Studio
+   1.0 says so in its model list; on Studio 0.6 the agent runs one warm-up completion with a tiny
+   `ping` tool, which also validates the API key and absorbs the cold start. Then it prints a
+   banner with the model, tokens/s, the workspace and the five demo prompts. `/quit` exits.
 6. **Web UI:**
    ```bash
    uv run mimoe-agent serve
@@ -83,18 +83,30 @@ About 5 minutes, plus a 2.5 GB model download.
 What to expect: on an Apple M1 Pro (16 GB) with Studio 0.6.5, `qwen3-4b-instruct-2507` decodes at
 about 40 tokens/s and takes about 2.7 s to the first token on the full 8-tool prompt (36 tokens/s
 on Studio 1.0.27); the first demo turn is about 10 s end to end from cold (two model calls). On a
-CPU-only Windows Server 2025 VM (6 vCPU, Studio 1.0.27) the same model did about 3.6 to 6.9
-tokens/s with 0.5 to 4.7 s to the first token, so budget half a minute per demo prompt there.
+CPU-only Windows Server 2025 VM (6 vCPU, Studio 1.0.27) the same model decodes at about 6
+tokens/s. There the first prompt takes about a minute, because the engine reads the roughly
+1,200-token system and tool prompt once (at about 25 tokens/s) and then caches it; after that each
+demo prompt takes 25 to 30 s.
 
-Tested on: macOS 26.6 on an Apple M1 Pro with Studio 0.6.5 and a 1.0.27 runtime; Ubuntu through
-CI (offline tests only). Tested on Windows: <pending gate>
+Tested on:
+
+- macOS 26.6 on an Apple M1 Pro (16 GB) with Studio 0.6.5 and a Studio 1.0.27 runtime: the offline
+  suite, the live smoke tests, the demo prompts in the terminal and the browser, and a real Ctrl-C
+  under a terminal (the turn ends within 0.2 s).
+- Windows Server 2025 (x64, CPU-only VM) with the Studio 1.0.27 runtime, installed from a ZIP of
+  this repository: the offline suite (all pass; 7 POSIX-only tests skip), the five demo prompts,
+  approve and deny, the web UI and API, a UTF-16 `.env`, and the Stop, memory and timeout kills
+  (no `python.exe` left behind).
+- Ubuntu through CI (offline tests only).
 
 If something fails at start-up the message ends with a Studio click path ("no model is loaded:
 Studio > Models > Load a chat model", "mimOE rejected the API key: Studio shows it under the API
 button", and so on) and the process exits with 1. `--base-url http://localhost:PORT/mimik-ai/openai/v1`
 if your Studio listens elsewhere. If you would rather not use uv, the project is a normal
 `pyproject.toml` (hatchling), so a Python 3.13 venv with `pip install -e .` should give you the
-same `mimoe-agent` command; I have only tested the uv path.
+same `mimoe-agent` command; I have only tested the uv path. On Windows, if Studio's runtime does
+not start and reports a missing `VCRUNTIME140.dll`, install the Microsoft Visual C++ 2015-2022 x64
+redistributable (most machines already have it).
 
 ## Try it
 
@@ -537,7 +549,7 @@ hint is on stderr), 130 for Ctrl-C at the prompt. Piped input works
 
 ```bash
 uv sync                                   # dependencies plus the dev group
-uv run pytest -q                          # 680 offline tests against the fake engine, no Studio needed
+uv run pytest -q                          # 684 offline tests against the fake engine, no Studio needed
 MIMOE_LIVE=1 uv run pytest -m live        # 3 smoke tests against a running Studio (a handful of completions)
 uvx ruff check . && uvx ruff format --check .
 cd web && npm ci && npm test && npm run build   # 29 vitest tests; the build writes web/dist
@@ -605,7 +617,10 @@ a diff I could not explain did not go in.
   `/verbose` is on.
 - Prompt wording matters with a 4B model: the plain CSV question sometimes gets a `read_file`
   answer with the header counted as a row, which is why the demo asks for `run_python`; the TODO
-  prompt usually searches `*.md` only.
+  prompt sometimes searches `*.md` only. The model also declines code it expects to run long or
+  use a lot of memory, because the tool description tells it about the 30 s and 2 GB limits, and
+  now and then it sends code with literal `\n` escapes instead of line breaks; the tool answers
+  that with a specific error so the model resends it properly.
 - Cancelling a turn closes the model stream, but Studio 0.6.5 has no cancel and keeps generating
   the abandoned answer for a moment, so the next prompt can wait a few seconds.
 - Single-user loopback server: no authentication, per-thread locks kept for the process lifetime,
