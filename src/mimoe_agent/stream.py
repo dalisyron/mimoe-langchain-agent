@@ -19,6 +19,14 @@ Events are plain dicts with an ``"event"`` key:
 ``done{status,elapsed_s,model,usage_total{input_tokens,output_tokens,llm_calls}}`` and
 ``error{message,hint}`` (no ``done`` after an error).
 
+Tool-call ids are made unique: mimOE numbers calls per response (``tool_0`` on every model call,
+verified on both generations) while the web UI keys its tool cards by id, so a repeated id is
+emitted as ``tool_0#2``, ``tool_0#3``... and the matching ``tool_result`` carries the same alias.
+The alias state (:class:`ToolCallIds`) lives for one run by default. A caller that shows one
+conversation turn over several runs (the server: a chat and the resumes that answer its
+approvals) passes the same object to each of them, so a call the model repeats with the raw id
+of an earlier run still gets a fresh alias and its result, arriving in the next run, follows it.
+
 Reasoning reaches the stream two ways and :class:`ThinkSplitter` turns both into ``thinking``
 events: inline ``<think>...</think>`` text on 0.6 engines (an empty block always precedes the
 answer with ``/no_think``; tags may be split across chunks) and
@@ -48,6 +56,36 @@ REASONING_KEY = "reasoning_content"
 UNKNOWN_MODEL = "unknown"
 
 Event = dict[str, Any]
+
+
+@dataclass
+class ToolCallIds:
+    """Tool-call id aliases: the raw id on first use, then ``"<id>#<n>"`` for every repeat.
+
+    One instance per run (the default of :func:`iter_events` / :func:`aiter_events`) keeps ids
+    unique within that run. One instance shared by the runs of a conversation turn (a chat plus
+    the resumes that answer its approvals) keeps them unique across those runs too, which a UI
+    that keys tool cards by id needs; the CLI prints events in order and does not.
+    """
+
+    counts: dict[str, int] = field(default_factory=dict)
+    """Raw id -> how many ``tool_call`` events used it."""
+    alias: dict[str, str] = field(default_factory=dict)
+    """Raw id -> the id emitted for its latest occurrence."""
+
+    def announce(self, raw_id: str | None) -> str | None:
+        """Return the id to emit for a new tool call and remember it for the call's result."""
+        if raw_id is None:
+            return None
+        count = self.counts.get(raw_id, 0) + 1
+        self.counts[raw_id] = count
+        alias = raw_id if count == 1 else f"{raw_id}#{count}"
+        self.alias[raw_id] = alias
+        return alias
+
+    def resolve(self, raw_id: str) -> str:
+        """Return the id to emit for a tool result: its call's latest alias, else the raw id."""
+        return self.alias.get(raw_id, raw_id)
 
 
 class ThinkSplitter:
@@ -200,20 +238,28 @@ def visible_text(message: BaseMessage) -> str:
     return "".join(event["text"] for event in events if event["event"] == "token")
 
 
-def iter_events(agent: Any, payload: Any, config: RunnableConfig | None = None) -> Iterator[Event]:
+def iter_events(
+    agent: Any,
+    payload: Any,
+    config: RunnableConfig | None = None,
+    *,
+    tool_ids: ToolCallIds | None = None,
+) -> Iterator[Event]:
     """Run the agent synchronously and yield UI events in order.
 
     Args:
         agent: The compiled ``create_agent`` graph.
         payload: ``{"messages": [HumanMessage]}`` for a new turn or ``Command(resume=...)``.
         config: The run config (``{"configurable": {"thread_id": ...}}``).
+        tool_ids: Tool-call id aliases shared with the other runs of the same conversation turn
+            (see :class:`ToolCallIds`); a fresh one for this run alone when omitted.
 
     Yields:
         Event dicts, ending with ``done`` (``status`` ``"completed"`` or ``"awaiting_approval"``)
         or with ``error`` when anything raised (``mimoe.friendly_error`` supplies the hint).
         A consumer that stops early (``close()``) closes the graph run with it.
     """
-    mapper = _EventMapper(agent, config)
+    mapper = _EventMapper(agent, config, tool_ids)
     stream: Iterator[Any] | None = None
     try:
         stream = agent.stream(payload, config, stream_mode=list(STREAM_MODES))
@@ -229,7 +275,11 @@ def iter_events(agent: Any, payload: Any, config: RunnableConfig | None = None) 
 
 
 async def aiter_events(
-    agent: Any, payload: Any, config: RunnableConfig | None = None
+    agent: Any,
+    payload: Any,
+    config: RunnableConfig | None = None,
+    *,
+    tool_ids: ToolCallIds | None = None,
 ) -> AsyncIterator[Event]:
     """Async twin of :func:`iter_events` built on ``agent.astream`` (same events, same order).
 
@@ -237,7 +287,7 @@ async def aiter_events(
     ``aclose()`` on this generator closes the graph run before it returns, instead of leaving
     the run's teardown to the event loop's garbage-collection hook.
     """
-    mapper = _EventMapper(agent, config)
+    mapper = _EventMapper(agent, config, tool_ids)
     stream: AsyncIterator[Any] | None = None
     try:
         stream = agent.astream(payload, config, stream_mode=list(STREAM_MODES))
@@ -279,7 +329,9 @@ class _ModelCall:
 class _EventMapper:
     """Shared state machine behind ``iter_events`` and ``aiter_events``."""
 
-    def __init__(self, agent: Any, config: Mapping[str, Any] | None) -> None:
+    def __init__(
+        self, agent: Any, config: Mapping[str, Any] | None, tool_ids: ToolCallIds | None = None
+    ) -> None:
         self._started = time.perf_counter()
         self._configured_model = _configured_model(agent, config)
         self._response_model: str | None = None
@@ -287,6 +339,7 @@ class _EventMapper:
         self._usage = {"input_tokens": 0, "output_tokens": 0, "llm_calls": 0}
         self._call: _ModelCall | None = None
         self._tool_calls_seen: set[tuple[str | None, str | None]] = set()
+        self._ids = tool_ids if tool_ids is not None else ToolCallIds()
         self._tool_results_seen: set[str] = set()
         self._notices_seen: set[str] = set()
         self._awaiting = False
@@ -402,7 +455,7 @@ class _EventMapper:
             events.append(
                 {
                     "event": "tool_call",
-                    "id": call_spec.get("id"),
+                    "id": self._ids.announce(call_spec.get("id")),
                     "name": call_spec.get("name"),
                     "args": dict(call_spec.get("args") or {}),
                 }
@@ -436,7 +489,7 @@ class _EventMapper:
         return [
             {
                 "event": "tool_result",
-                "id": message.tool_call_id,
+                "id": self._ids.resolve(message.tool_call_id),
                 "name": message.name,
                 "content": message_text(message),
                 "is_error": message.status == "error",

@@ -23,7 +23,7 @@ from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
 )
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
@@ -38,10 +38,11 @@ from mimoe_agent.mimoe import (
     MimoeClient,
     preflight,
 )
-from mimoe_agent.stream import ThinkSplitter, aiter_events, iter_events, visible_text
+from mimoe_agent.stream import ThinkSplitter, ToolCallIds, aiter_events, iter_events, visible_text
 
 Event = dict[str, Any]
-Runner = Callable[[Any, Any, dict[str, Any]], list[Event]]
+Runner = Callable[..., list[Event]]
+"""``run(agent, payload, config, **kwargs)``: one run's events; ``kwargs`` go to ``iter_events``."""
 
 REPO_WORKSPACE = Path(__file__).resolve().parent.parent / "workspace"
 LIVE_BASE_URL = "http://127.0.0.1:8083/mimik-ai/openai/v1"
@@ -151,14 +152,16 @@ def model_chunk(text: str, run_id: str = "lc_run--1", **extra: Any) -> tuple[str
 def run(request: pytest.FixtureRequest) -> Iterator[Runner]:
     """Collect the events of one run through ``iter_events`` or ``aiter_events``."""
     if request.param == "sync":
-        yield lambda agent, payload, config: list(iter_events(agent, payload, config))
+        yield lambda agent, payload, config, **kw: list(iter_events(agent, payload, config, **kw))
         return
     loop = asyncio.new_event_loop()
 
-    async def collect(agent: Any, payload: Any, config: dict[str, Any]) -> list[Event]:
-        return [event async for event in aiter_events(agent, payload, config)]
+    async def collect(agent: Any, payload: Any, config: dict[str, Any], **kw: Any) -> list[Event]:
+        return [event async for event in aiter_events(agent, payload, config, **kw)]
 
-    yield lambda agent, payload, config: loop.run_until_complete(collect(agent, payload, config))
+    yield lambda agent, payload, config, **kw: loop.run_until_complete(
+        collect(agent, payload, config, **kw)
+    )
     loop.close()
 
 
@@ -358,8 +361,11 @@ def test_model_call_limit_notice(fake_mimoe: FakeMimoe, workspace_tmp: Path, run
         fake_mimoe.script({"tool_calls": [{"name": "add", "args": {"a": 1, "b": 1}}]})
     events = run(agent, {"messages": [HumanMessage("loop")]}, cfg("loop"))
     assert names(events) == ["tool_call", "tool_result"] * 3 + ["notice", "done"]
-    # mimOE reuses id tool_0 on every reply: one tool_call event per AI message, not per id
-    assert [event["id"] for event in events if event["event"] == "tool_call"] == ["tool_0"] * 3
+    # mimOE reuses id tool_0 on every reply: one tool_call event per AI message, with the
+    # repeated id made unique for the run (the web UI keys its tool cards by id)
+    ids = ["tool_0", "tool_0#2", "tool_0#3"]
+    assert [event["id"] for event in events if event["event"] == "tool_call"] == ids
+    assert [event["id"] for event in events if event["event"] == "tool_result"] == ids
     assert events[-2] == {
         "event": "notice",
         "text": "Model call limits exceeded: thread limit (3/3)",
@@ -463,6 +469,103 @@ def test_one_interrupt_for_two_gated_calls(
     assert results["tool_1"]["is_error"] is True and "not b" in results["tool_1"]["content"]
     assert text_of(second, "token") == "Did a only."
     assert second[-1]["status"] == "completed"
+
+
+def test_repeated_tool_call_ids_are_unique_within_a_run(
+    fake_mimoe: FakeMimoe, workspace_tmp: Path, run: Runner
+) -> None:
+    """Two model calls that both answer with ``tool_0`` (what 0.6 engines do every time): the
+    second call is emitted as ``tool_0#2`` and its result follows the alias."""
+    agent = build_agent(fake_mimoe, workspace_tmp, hitl=False)
+    fake_mimoe.script(
+        {"tool_calls": [{"name": "add", "args": {"a": 1, "b": 1}}]},
+        {"tool_calls": [{"name": "add", "args": {"a": 2, "b": 2}}]},
+        {"content": "2 then 4."},
+    )
+    events = run(agent, {"messages": [HumanMessage("add twice")]}, cfg("repeat-ids"))
+    assert names(events) == ["tool_call", "tool_result"] * 2 + ["token"] * 3 + ["done"]
+    calls = [e for e in events if e["event"] == "tool_call"]
+    results = [e for e in events if e["event"] == "tool_result"]
+    assert [(c["id"], c["args"]) for c in calls] == [
+        ("tool_0", {"a": 1, "b": 1}),
+        ("tool_0#2", {"a": 2, "b": 2}),
+    ]
+    assert [(r["id"], r["content"]) for r in results] == [("tool_0", "2"), ("tool_0#2", "4")]
+    assert usage_of(events)["llm_calls"] == 3
+
+
+def test_tool_call_id_aliases_on_canned_output(run: Runner) -> None:
+    """The alias maps the raw id to its latest occurrence: results are remapped to the alias in
+    force when they arrive, a fresh id is never touched, and a new run starts with no aliases."""
+
+    def call(message_id: str, call_id: str, value: int) -> AIMessage:
+        return AIMessage(
+            content="",
+            id=message_id,
+            tool_calls=[
+                {"name": "add", "args": {"a": value, "b": 0}, "id": call_id, "type": "tool_call"}
+            ],
+        )
+
+    def result(call_id: str, value: int) -> ToolMessage:
+        return ToolMessage(content=str(value), name="add", tool_call_id=call_id, id=f"r-{value}")
+
+    graph = ScriptedGraph(
+        ("updates", {"model": {"messages": [call("m1", "tool_0", 1)]}}),
+        ("updates", {"tools": {"messages": [result("tool_0", 1)]}}),
+        ("updates", {"model": {"messages": [call("m2", "tool_0", 2)]}}),
+        ("updates", {"tools": {"messages": [result("tool_0", 2)]}}),
+        ("updates", {"model": {"messages": [call("m3", "tool_1", 3)]}}),
+        ("updates", {"tools": {"messages": [result("tool_1", 3)]}}),
+        ("updates", {"model": {"messages": [call("m4", "tool_0", 4)]}}),
+        ("updates", {"tools": {"messages": [result("tool_0", 4)]}}),
+    )
+    events = run(graph, {"messages": [HumanMessage("go")]}, cfg("alias"))
+    pairs = [(e["event"], e["id"]) for e in events if e["event"] != "done"]
+    assert pairs == [
+        ("tool_call", "tool_0"),
+        ("tool_result", "tool_0"),
+        ("tool_call", "tool_0#2"),
+        ("tool_result", "tool_0#2"),
+        ("tool_call", "tool_1"),
+        ("tool_result", "tool_1"),
+        ("tool_call", "tool_0#3"),
+        ("tool_result", "tool_0#3"),
+    ]
+    # a resumed run (its own iterator) sees the result of a call announced by the previous run
+    resumed = ScriptedGraph(("updates", {"tools": {"messages": [result("tool_0", 5)]}}))
+    events = run(resumed, Command(resume={"decisions": [{"type": "approve"}]}), cfg("alias"))
+    assert [(e["event"], e["id"]) for e in events if e["event"] != "done"] == [
+        ("tool_result", "tool_0")
+    ]
+
+
+def test_tool_ids_shared_across_the_runs_of_a_turn(
+    fake_mimoe: FakeMimoe, workspace_tmp: Path, run: Runner
+) -> None:
+    """A chat and the resumes that answer its approvals share one ``ToolCallIds``: the call the
+    model repeats as ``tool_0`` in the resumed run becomes ``tool_0#2``, and its result, which
+    arrives in the run after that, follows the alias (each run on its own would say ``tool_0``
+    three times, and a UI keyed by id would put the second result on the first card)."""
+    agent = build_agent(fake_mimoe, workspace_tmp)
+    fake_mimoe.script(
+        {"tool_calls": [{"name": "echo", "args": {"text": "a"}}]},
+        {"tool_calls": [{"name": "echo", "args": {"text": "b"}}]},
+        {"content": "Both echoed."},
+    )
+    ids = ToolCallIds()
+    approve = Command(resume={"decisions": [{"type": "approve"}]})
+    first = run(agent, {"messages": [HumanMessage("echo a, then b")]}, cfg("shared"), tool_ids=ids)
+    assert names(first) == ["tool_call", "approval_required", "done"]
+    assert first[0]["id"] == "tool_0"
+    second = run(agent, approve, cfg("shared"), tool_ids=ids)
+    assert names(second) == ["tool_result", "tool_call", "approval_required", "done"]
+    assert (second[0]["id"], second[0]["content"]) == ("tool_0", "ECHO: a")
+    assert (second[1]["id"], second[1]["args"]) == ("tool_0#2", {"text": "b"})
+    third = run(agent, approve, cfg("shared"), tool_ids=ids)
+    assert names(third) == ["tool_result", "token", "token", "done"]
+    assert (third[0]["id"], third[0]["content"]) == ("tool_0#2", "ECHO: b")
+    assert ids.counts == {"tool_0": 2} and ids.alias == {"tool_0": "tool_0#2"}
 
 
 def test_later_turn_does_not_replay_earlier_tool_results(
