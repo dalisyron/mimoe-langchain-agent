@@ -137,7 +137,7 @@ def test_system_prompt_variants(settings_tmp: Settings, preflight_fake: Prefligh
     assert soft.startswith("/no_think\n")
     assert settings_tmp.workspace.as_posix() in soft and "{workspace}" not in soft
     assert soft.removeprefix("/no_think\n") == SYSTEM_PROMPT.replace(
-        "{workspace}", str(settings_tmp.workspace)
+        "{workspace}", settings_tmp.workspace.as_posix()
     )
     thinking = system_prompt(dataclasses.replace(settings_tmp, think=True), preflight_fake)
     assert "/no_think" not in thinking
