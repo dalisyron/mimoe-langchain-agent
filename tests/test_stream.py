@@ -836,7 +836,7 @@ def test_visible_text_of_final_message() -> None:
 @pytest.mark.live
 @pytest.mark.skipif(not LIVE, reason="set MIMOE_LIVE=1 with mimOE Studio running on 8083")
 def test_live_list_files_round_trip() -> None:
-    """One real run on Studio 0.6.5 / qwen3-4b (``MIMOE_LIVE=1``): prints the event names."""
+    """One real run on whatever chat model Studio has loaded (``MIMOE_LIVE=1``)."""
     from mimoe_agent.tools.workspace import Workspace, make_workspace_tools
 
     settings = load_settings({"workspace": REPO_WORKSPACE, "base_url": LIVE_BASE_URL})
@@ -863,5 +863,5 @@ def test_live_list_files_round_trip() -> None:
     assert "tool_call" in names(events)
     assert "tool_result" in names(events)
     assert events[-1]["event"] == "done" and events[-1]["status"] == "completed"
-    assert events[-1]["model"] == "qwen3-4b"
+    assert events[-1]["model"] == pre.model.id
     assert "<think>" not in text_of(events, "token")

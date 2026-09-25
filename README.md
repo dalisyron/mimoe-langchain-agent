@@ -25,8 +25,9 @@ TODOs") and a local model answers them by calling tools: list, read and search f
 a calculator, the clock, read-only git, and a status tool that reports on the engine itself. The
 only tool that can change anything, `run_python`, stops the run and asks you to approve or deny the
 code, in the terminal and in the browser, before anything executes. Everything is on-device: the
-model runs in mimOE Studio, the agent's own tools never open a network connection, and the web
-server only listens on `127.0.0.1`.
+model runs in mimOE Studio (the agent never picks a cloud or provider model that Studio may also
+list), the agent's own tools never open a network connection, and the web server only listens on
+`127.0.0.1`.
 
 ![The web UI on start: engine badge, model picker and the five demo prompts](docs/img/web-empty-state.png)
 
@@ -116,8 +117,9 @@ call in every recorded run (CLI transcript 02, the browser session). It is also 
 shows the approval flow, which is the point of the demo.
 
 REPL commands: `/new` (fresh conversation), `/status`, `/verbose` (full tool results), `/model ID`
-(switch model), `/models`, `/help`, `/quit`. Ctrl-C while the model is answering cancels that turn
-and keeps the session. `--think` turns the model's reasoning on and shows it collapsed.
+(switch model), `/models`, `/help`, `/quit`. Ctrl-C during a turn cancels it at once (the answer
+stops and a running snippet is killed) and keeps the session. `--think` turns the model's reasoning
+on and shows it collapsed.
 
 The transcripts: `01-demo-prompts.md` (the five prompts with the approval), `02-denied-run-python.md`,
 `03-model-switch.md`, `04-piped-stdin.md`, `05-models-list.md`, `06-ctrl-c-mid-turn.md`,
@@ -246,7 +248,9 @@ What each module does, in reading order:
   `git`, `mimoe_status`).
 - `models.py`: the six model presets with their measured notes, `pull` through the registry of
   either generation, and `switch_model`.
-- `cli.py`: the REPL, `serve`, and the `models` subcommands.
+- `cli.py`: the REPL, `serve`, and the `models` subcommands. Each turn runs on a worker thread
+  while the REPL thread renders its events, because LangGraph runs graph nodes on pool threads
+  and Python delivers Ctrl-C only to the main thread; Ctrl-C sets the turn's cancel signal.
 - `server.py`: the HTTP API below, one `asyncio.Lock` per thread, lazy start (the server comes up
   even when Studio is down and reports the hint in `/api/health`), and the static bundle.
 - `web/src`: `events.ts` (the wire types), `sse.ts` (parser), `api.ts`, `reducer.ts` (events to
@@ -427,6 +431,13 @@ with `qwen3-4b` loaded; the 1.0.27 points come from the compatibility matrix.
 12. Studio 0.6.5 holds one chat model: loading another evicts the first, and once in a while it
     answered a load request with 201 without actually loading (the agent re-reads `GET /models`
     after every load and says so when the model is not there).
+13. An error in the middle of a 0.6.5 stream (for example `llama_decode` failing when the context
+    fills up) is written without the blank line that ends an SSE event, so a standard client just
+    sees the stream stop and returns a cut-off answer. The agent treats a stream that ends without
+    a `finish_reason` as an error with a context/memory hint.
+14. `GET /models` can also list models mimOE does not run locally: a configured cloud model on 0.6
+    (`owned_by: "cloud"`) and provider models on 1.0 (`owned_by: "provider:<id>"`, `attached`).
+    The agent never picks those on its own and warns if you name one with `--model`.
 
 ## Safety, honestly
 
@@ -441,35 +452,45 @@ What `run_python` does to keep accidents small (none of it is a sandbox):
   friends; none of your other variables, so no secrets leak into it). The workspace goes on
   `sys.path` only after start-up, so a `sitecustomize.py` in it cannot run before the approved
   code, and `import mimoe_agent` is blocked in the child.
-- Limits: 30 s wall clock, then the whole process tree is killed (a process group `SIGKILL` on
-  POSIX, `taskkill /T` on Windows); 32 MB of combined output kills it too; files it writes are
-  capped at 64 MB on POSIX (`RLIMIT_FSIZE`); the model sees at most 8 KB of output.
-- What escapes those limits: there is no memory limit (macOS does not enforce `RLIMIT_AS`); a
-  snippet that calls `setsid` leaves the process group and survives the kill on POSIX; on Windows
-  a grandchild whose parent already exited survives `taskkill /T` (no Job Objects); the socket
-  guard (unless `--allow-network`, `socket.socket` raises "network disabled for run_python") does
-  not block DNS lookups and is bypassable through the `_socket` module. It stops accidental
-  network use, nothing more. Ctrl-C in the CLI kills a running snippet's process tree and keeps
-  the session. Stop in the web UI returns at once, but a snippet that is already running continues
-  until it finishes or hits 30 s, and so does a CLI snippet when the model asked for several
-  tools in one step.
+- Limits, checked ten times a second: 30 s wall clock, more than 2 GB of resident memory across
+  the snippet and everything it spawned (measured with `psutil`, because macOS enforces no memory
+  rlimit and a runaway snippet would otherwise push the machine into swap), or 32 MB of combined
+  output, and the whole process tree is killed (a process group `SIGKILL` on POSIX, `taskkill /T`
+  on Windows). Files it writes are capped at 64 MB on POSIX (`RLIMIT_FSIZE`); the model sees at
+  most 8 KB of output.
+- Ctrl-C in the CLI and Stop in the web UI end the turn at once: the turn's cancel signal kills a
+  running snippet's tree and closes the model's stream.
+- What escapes those limits: the memory check is a poll, so a very fast allocation can overshoot
+  for a fraction of a second before the kill; a snippet that calls `setsid` leaves the process
+  group and survives the kill on POSIX; on Windows a grandchild whose parent already exited
+  survives `taskkill /T` (no Job Objects); the socket guard (unless `--allow-network`,
+  `socket.socket` raises "network disabled for run_python") does not block DNS lookups and is
+  bypassable through the `_socket` module. It stops accidental network use, nothing more.
 - Before you approve, both clients print a red warning when the code mentions sockets, `urllib`,
   `requests`, `httpx`, `subprocess`, `os.system`, `shutil.rmtree`, `os.remove` or opening a file
-  for writing. Read the code anyway.
+  for writing, and another when it contains invisible or terminal-control characters (zero-width
+  and bidirectional-override characters, ESC sequences). Those are shown escaped, so code cannot
+  look different on screen from what runs. Read the code anyway.
 
 The other tools:
 
 - `list_files`, `read_file`, `search_files` are jailed to the workspace: `..`, absolute paths,
   drive letters, UNC paths, symlinks and junctions that point outside, and reserved Windows names
-  are refused; listing and searching skip `.git`, `node_modules`, `.venv` and similar; files whose
-  names look like secrets (`.env*`, `*.pem`, `*.key`, `id_*`, `credentials*`, `*token*`,
-  `*secret*`, ...) are refused, as are binaries and files over 2 MB. The jail is by path, so a
-  workspace's `.git/config` is readable by `read_file`, and approved Python can of course read
-  anything you can.
-- `git` is read-only (`status`, `log`, `diff`), runs without a shell, disables pagers, prompts,
-  hooks and external diff drivers, and times out after 20 s. It reports on the repository that
-  contains the workspace; the sample workspace lives in this repository, so `git log` shows my
-  commits.
+  are refused; listing and searching skip `.git`, `node_modules`, `.venv` and similar; credential
+  files (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `credentials`, `.netrc`, `token.json` and
+  similar, matched after Unicode normalisation and case folding) are refused, as are binaries and
+  files over 2 MB. The jail is by path, so a workspace's `.git/config` is readable by `read_file`,
+  and approved Python can of course read anything you can.
+- `git` is read-only (`status`, `log`, `diff`) and runs without a shell, pager or prompt. It runs
+  none of the repository's own code: hooks are pointed at the null device (`status` and `diff`
+  rewrite the index, which fires `post-index-change`), filter drivers from the repository's config
+  are disabled, and external diff, textconv and submodule recursion are off. Inherited `GIT_*`
+  variables are dropped, so the tool always reports on the repository that contains the
+  workspace; it times out after 20 s. The sample workspace lives in this repository, so `git log`
+  shows my commits.
+- Everything the model, a tool or the engine says is shown in the terminal with control
+  sequences escaped: an ESC in a file or an answer could otherwise move the cursor, retitle the
+  window or write your clipboard (OSC 52).
 - `calculator` evaluates through an AST whitelist, no `eval`; expressions that would produce more
   than 100,000 digits are refused before they are computed.
 - The web server binds `127.0.0.1` only, has no `--host` flag, accepts only `127.0.0.1`,
@@ -496,7 +517,7 @@ silent `false`. `.env.example` lists the keys.
 
 | Setting | Flag | Environment | From `.env` | Default |
 |---|---|---|---|---|
-| Base URL | `--base-url` | `MIMOE_BASE_URL` | yes | auto-discover: `http://localhost:8083/mimik-ai/openai/v1`, then `http://localhost:8083/openai/v1`; an explicit URL is never replaced by a candidate |
+| Base URL | `--base-url` | `MIMOE_BASE_URL` | yes | auto-discover: `http://127.0.0.1:8083/mimik-ai/openai/v1`, then `/openai/v1` on the same port, then `localhost` (IPv4 first: Windows spends about 2 s on every refused IPv6 connect); an explicit URL is never replaced by a candidate |
 | API key | `--api-key` | `MIMOE_API_KEY` | yes | `1234`, validated by the warm-up completion |
 | Model | `--model` | `MIMOE_MODEL` | yes | the first loaded chat model; the id must be loaded (`models use` loads it) |
 | Workspace | `--workspace` | `MIMOE_WORKSPACE` | yes | `./workspace`; an error with a hint if it does not exist |
@@ -516,10 +537,10 @@ hint is on stderr), 130 for Ctrl-C at the prompt. Piped input works
 
 ```bash
 uv sync                                   # dependencies plus the dev group
-uv run pytest -q                          # 652 offline tests against the fake engine, no Studio needed
+uv run pytest -q                          # 680 offline tests against the fake engine, no Studio needed
 MIMOE_LIVE=1 uv run pytest -m live        # 3 smoke tests against a running Studio (a handful of completions)
 uvx ruff check . && uvx ruff format --check .
-cd web && npm ci && npm test && npm run build   # 27 vitest tests; the build writes web/dist
+cd web && npm ci && npm test && npm run build   # 29 vitest tests; the build writes web/dist
 ```
 
 The committed bundle: `web/dist` is in git so that reviewers do not need Node.js. After a UI change
@@ -538,7 +559,7 @@ against the fake store. `tests/test_live.py` is the only file that talks to a re
 CI (`.github/workflows/ci.yml`): `lint` runs ruff on Ubuntu; `test` runs the offline suite plus a
 `mimoe-agent --help` smoke on `ubuntu-latest` and `windows-latest` with Python 3.13 from
 `uv sync --locked`; `web` runs `npm ci`, the vitest suite, the build and the bundle diff on Node 22.
-Markdown-only changes do not trigger it.
+Changes to only `README.md` or `docs/` do not trigger it.
 
 ## How I used AI coding assistants
 
@@ -548,8 +569,10 @@ LangGraph 1.2 APIs against the installed source rather than the docs, probed the
 both Studio generations and wrote down what they found; most of the "found by probing" list above
 started there. Next it drafted a plan, which I revised with it and approved before any code was
 written, and an interface contract (`docs/CONTRACTS.md`: signatures, data shapes, the SSE event
-protocol); implementation agents then worked in parallel on disjoint files against that contract. Each module then went to an adversarial reviewer whose job was to break it
-and add a regression test for whatever it broke. The model compatibility matrix was a separate,
+protocol); implementation agents then worked in parallel on disjoint files against that contract.
+Each module then went to an adversarial reviewer whose job was to break it and add a regression
+test for whatever it broke, and a final six-lens review of the whole repository found the last
+round of defects. The model compatibility matrix was a separate,
 measured job, and the CLI transcripts and the browser session are recordings of real runs, not
 prose written by hand.
 
@@ -561,6 +584,9 @@ Things the assistant got wrong that tests or reviews caught:
 | Tool-call ids that collided across the model calls of one turn on the 0.6 engine (every reply is `tool_0`), so the web UI updated the wrong card after an approval | The server reviewer's resume test. Ids are aliased per conversation turn (`tool_0#2`) |
 | A thinking-control rule keyed on the engine's `reasoning.can_disable` flag, which the matrix showed is `false` for every model on 1.0.27 although `enable_thinking: false` works | The compatibility matrix. The rule follows the engine generation instead |
 | Two jobs using the two local engines at once: a live check auto-loaded a 2.5 GB model on one engine while the matrix had an 8B model loaded on the other | The 0.6.5 engine crashed with a Metal out-of-memory abort. The affected speed numbers are marked as not representative, the jobs got a one-model-at-a-time rule, and the agent unloads before it loads |
+| Ctrl-C was meant to kill a running snippet, but LangGraph runs graph nodes on pool threads while it streams events, so the interrupt never reached the tool and the REPL froze until the step ended | The final review, reproduced with real SIGINTs under a pseudo-terminal. Each turn now runs on a worker thread with a cancel signal that kills the snippet and closes the model stream; tests interrupt the real REPL thread |
+| The approval prompt printed model-written code with raw terminal escapes, so a snippet could erase a line and show something other than what runs | The final review, reproduced with a hidden line that ran after approval. Output is escaped and the prompt warns in red |
+| The git tests inherited `GIT_DIR` and `GIT_INDEX_FILE`. A reviewing agent confirmed it by running the suite from a pre-commit hook in a linked worktree; each test commit fired the hook again, the processes multiplied and my laptop stopped responding until I forced a restart | Traced afterwards from the agents' transcripts. The tests and the git tool now drop inherited `GIT_*` variables, the git tool runs no repository hooks or filters, `run_python` got its 2 GB memory cap, and the remaining agents ran under explicit resource rules |
 
 Every design decision described above was mine to approve: the assistant proposed, I chose, and
 a diff I could not explain did not go in.
@@ -573,17 +599,15 @@ a diff I could not explain did not go in.
 - No `fetch_url` tool yet. I cut it from this version; the design I want is a per-URL approval like
   `run_python`, IP pinning against SSRF (resolve once, refuse private ranges, connect to that
   address), a wall-clock limit and a size cap.
-- No Windows Job Objects and no memory limit for `run_python`; the timeout, the output cap and
-  the per-file cap are what there is.
+- No Windows Job Objects: a grandchild whose parent already exited survives `taskkill /T`, and
+  the memory cap is a poll rather than an operating-system limit.
 - Thinking is hidden unless you pass `--think`, and then only a one-line summary shows unless
   `/verbose` is on.
 - Prompt wording matters with a 4B model: the plain CSV question sometimes gets a `read_file`
   answer with the header counted as a row, which is why the demo asks for `run_python`; the TODO
   prompt usually searches `*.md` only.
-- Cancelling a turn (Ctrl-C, Stop) does not stop generation on Studio 0.6.5, which has no cancel
-  and keeps generating the abandoned answer, so the next prompt can wait a few seconds; after Stop in
-  the web UI a `run_python` snippet that is already running continues to its end or its 30 s
-  limit.
+- Cancelling a turn closes the model stream, but Studio 0.6.5 has no cancel and keeps generating
+  the abandoned answer for a moment, so the next prompt can wait a few seconds.
 - Single-user loopback server: no authentication, per-thread locks kept for the process lifetime,
   no cap on the message size (a very large message is checkpointed and then hits the context error
   on every later turn; use New conversation).
@@ -592,8 +616,8 @@ a diff I could not explain did not go in.
   context eventually, at which point the agent tells you to start a new one.
 - Studio 1.0.27 was exercised with a standalone runtime and the compatibility matrix; the recorded
   CLI and browser sessions are all on Studio 0.6.5.
-- A switch to a chat-only model while an approval is pending leaves that approval unresumable
-  (the rebuilt graph has no tools node); start a new conversation.
+- Switching models while an approval is pending: answer the approval first, or start a new
+  conversation after the switch.
 
 ## License
 
