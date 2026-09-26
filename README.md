@@ -33,7 +33,9 @@ list), the agent's own tools never open a network connection, and the web server
 
 ![run_python asks for approval before the code runs](docs/img/web-approval-panel.png)
 
-![After Approve: the tool result, the answer and the stats for the turn](docs/img/web-approved-answer.png)
+![After Approve: the tool call as one line (click it for the code and its output), the answer and the stats for the turn](docs/img/web-approved-answer.png)
+
+![A failed tool call is one line too: the calculator refused a loop, so the agent ran Python instead and answered](docs/img/web-failed-step.png)
 
 ## Quickstart
 
@@ -128,7 +130,8 @@ and what is the total revenue?") qwen3-4b on a fresh session sometimes read the 
 call in every recorded run (CLI transcript 02, the browser session). It is also the prompt that
 shows the approval flow, which is the point of the demo.
 
-REPL commands: `/new` (fresh conversation), `/status`, `/verbose` (full tool results), `/model ID`
+REPL commands: `/new` (fresh conversation), `/status`, `/verbose` (full tool results, and the
+error of a failed call, which otherwise shows as one "failed, trying a different approach" line), `/model ID`
 (switch model), `/models`, `/help`, `/quit`. Ctrl-C during a turn cancels it at once (the answer
 stops and a running snippet is killed) and keeps the session. `--think` turns the model's reasoning
 on and shows it collapsed.
@@ -196,7 +199,7 @@ Two lines of LangGraph vocabulary, since `create_agent` compiles to a LangGraph 
 | React + Vite + TypeScript with the built bundle committed in `web/dist` | The reviewer needs no Node.js; the UI is about 750 lines with no UI kit, and the reducer, SSE parser and stream consumer have vitest tests. | Streamlit or Gradio: fast to start, but the per-turn tool cards, the approval panel with one decision per request, Stop and resume did not fit their request/rerun model. |
 | uv | One command installs Python 3.13 and the locked dependencies on macOS, Windows and Linux; `uv run mimoe-agent` is the whole quickstart. | pip or poetry: pip needs a Python 3.13 and a venv first; poetry is one more tool to install. |
 | Plain `@tool` functions, with pandas available to `run_python` | Eight ordinary functions whose docstrings are the descriptions the model reads; pandas because the model reaches for it every time and gets CSVs right (my csv-module fallback miscounted the header row). | RAG, a vector store or SQLite: the workspace is small, `read_file`/`search_files`/`run_python` answer everything, and an index is more setup, more dependencies and one more thing that can be stale. |
-| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 705 tests run on CI without Studio; four live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
+| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 707 tests run on CI without Studio; five live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
 | Python 3.13 as the floor | The workspace jail uses `ntpath.isreserved` (new in 3.13) and `Path.is_junction` (3.12) for Windows; uv installs 3.13 anyway. | Supporting 3.10 to 3.12 with fallbacks: more code paths to test on Windows for no benefit to the reviewer. |
 
 ## How the components connect
@@ -248,9 +251,10 @@ What each module does, in reading order:
   `/no_think` on 0.6 engines, neutralises a malformed tool call), `GuardrailMiddleware` (caps every
   tool result at 8 KB, turns a tool exception into an error message the model can read, marks a
   result that reports a failure, such as `ERROR: ...` or a snippet that exited non-zero, as failed
-  so both interfaces show it in red, shortens tool results from earlier turns to 400 characters in
-  the request only, resets the per-turn budget), `ModelCallLimitMiddleware(thread_limit=8)`, and `HumanInTheLoopMiddleware` on
-  `run_python` (omitted with `--auto-approve`).
+  so both interfaces can say so in one line while the model reads the error, shortens tool results
+  from earlier turns to 400 characters in the request only, resets the per-turn budget),
+  `ModelCallLimitMiddleware(thread_limit=8)`, and `HumanInTheLoopMiddleware` on `run_python`
+  (omitted with `--auto-approve`).
 - `stream.py`: drives `agent.stream(..., stream_mode=["messages", "updates"])` and maps what
   LangGraph yields to neutral event dicts. Both clients use it, so the CLI and the web UI cannot
   drift apart. It also splits thinking from answer text in both transports (inline tags on 0.6,
@@ -550,10 +554,10 @@ hint is on stderr), 130 for Ctrl-C at the prompt. Piped input works
 
 ```bash
 uv sync                                   # dependencies plus the dev group
-uv run pytest -q                          # 705 offline tests against the fake engine, no Studio needed
-MIMOE_LIVE=1 uv run pytest -m live        # 4 live tests against a running Studio (a handful of completions)
+uv run pytest -q                          # 707 offline tests against the fake engine, no Studio needed
+MIMOE_LIVE=1 uv run pytest -m live        # 5 live tests against a running Studio (a handful of completions)
 uvx ruff check . && uvx ruff format --check .
-cd web && npm ci && npm test && npm run build   # 29 vitest tests; the build writes web/dist
+cd web && npm ci && npm test && npm run build   # 35 vitest tests; the build writes web/dist
 ```
 
 The committed bundle: `web/dist` is in git so that reviewers do not need Node.js. After a UI change
@@ -601,6 +605,7 @@ Things the assistant got wrong that tests or reviews caught:
 | The approval prompt printed model-written code with raw terminal escapes, so a snippet could erase a line and show something other than what runs | The final review, reproduced with a hidden line that ran after approval. Output is escaped and the prompt warns in red |
 | The git tests inherited `GIT_DIR` and `GIT_INDEX_FILE`. A reviewing agent confirmed it by running the suite from a pre-commit hook in a linked worktree; each test commit fired the hook again, the processes multiplied and my laptop stopped responding until I forced a restart | Traced afterwards from the agents' transcripts. The tests and the git tool now drop inherited `GIT_*` variables, the git tool runs no repository hooks or filters, `run_python` got its 2 GB memory cap, and the remaining agents ran under explicit resource rules |
 | A calculator error that named the refused syntax (`unsupported syntax: GeneratorExp`) but not the tool to use instead, on a call the web UI showed as done because only exceptions counted as failures. Asked how many primes lie between 1000 and 4500, qwen3-4b-instruct-2507 sent the same expression again and then answered 543 "after checking known prime distribution data" (there are 442) | My own session in the web UI, then replayed from the engine log with the exact messages: with the old error the model resent the call in 3 of 3 runs, with an error that names `run_python` it switched to `run_python` in 3 of 3. The calculator's description now says what it cannot run, its errors point to `run_python`, a result that reports a failure shows as failed in both interfaces, and a live test replays the step |
+| A system-prompt rule, "Only state numbers that appear in a tool result", that qwen3-4b-instruct-2507 did not take as a reason to call a tool. Asked for the sum of the multiples of 5 between 432 and 43229, it worked the series out in text and answered 186,000,000 (the sum is 186,842,970) | My own session, then first-step replays of about twenty questions under five prompt wordings: with the old rule the model did 6 of 8 number questions in its head, four of them wrong. The rule now says never to do arithmetic in your head and names `calculator` and `run_python`: 7 of 8 go to a tool, questions about facts and the workspace get the same tools as before, and a live test replays the question. A longer rule that listed sums, averages and percentages did worse (4 of 10) |
 
 Every design decision described above was mine to approve: the assistant proposed, I chose, and
 a diff I could not explain did not go in.
@@ -622,7 +627,9 @@ a diff I could not explain did not go in.
   prompt sometimes searches `*.md` only. The model also declines code it expects to run long or
   use a lot of memory, because the tool description tells it about the 30 s and 2 GB limits, and
   now and then it sends code with literal `\n` escapes instead of line breaks; the tool answers
-  that with a specific error so the model resends it properly.
+  that with a specific error so the model resends it properly. Small arithmetic, such as the
+  average of five numbers or a bill split three ways, is still sometimes answered without a tool
+  (correctly, in my runs); larger and multi-step calculations go to `calculator` or `run_python`.
 - Cancelling a turn closes the model stream, but Studio 0.6.5 has no cancel and keeps generating
   the abandoned answer for a moment, so the next prompt can wait a few seconds.
 - Single-user loopback server: no authentication, per-thread locks kept for the process lifetime,
