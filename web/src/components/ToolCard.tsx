@@ -1,9 +1,6 @@
 import type { Json } from '../events';
-import type { ToolBlock, ToolStatus } from '../reducer';
-
-const LABEL: Record<ToolStatus, string> = {
-  running: 'running…', awaiting_approval: 'needs approval', done: 'done', error: 'error', denied: 'denied',
-};
+import type { ToolBlock } from '../reducer';
+import { stepLabel } from '../steps';
 
 /** run_python's `code` is shown as code; every other argument as JSON. */
 export function splitCode(args: Json): [string | null, Json] {
@@ -21,20 +18,18 @@ export function Args({ args }: { args: Json }) {
   );
 }
 
-export function ToolCard({ block }: { block: ToolBlock }) {
+/**
+ * A tool call as one muted line ("Reading notes.md…", "Calculating failed, trying a different approach").
+ * The arguments and the result, errors included, stay one click away; the approval panel shows code in full.
+ */
+export function ToolCard({ block, retrying }: { block: ToolBlock; retrying: boolean }) {
   return (
-    <div className={`tool tool-${block.status}`}>
-      <div className="tool-head">
-        <code>{block.name}</code>
-        <span className="chip">{LABEL[block.status]}</span>
+    <details className={`step step-${block.status}`}>
+      <summary>{stepLabel(block, retrying)}</summary>
+      <div className="step-detail">
+        <Args args={block.args} />
+        {block.result !== undefined && <pre className="result">{block.result}</pre>}
       </div>
-      <Args args={block.args} />
-      {block.result !== undefined && (
-        <details open={block.status === 'error' || block.status === 'denied'}>
-          <summary>result ({block.result.length} chars)</summary>
-          <pre className="result">{block.result}</pre>
-        </details>
-      )}
-    </div>
+    </details>
   );
 }

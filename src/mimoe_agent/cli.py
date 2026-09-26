@@ -76,6 +76,9 @@ EXIT_ERROR = 1
 EXIT_INTERRUPT = 130
 RESULT_PREVIEW_LINES = 3
 """Lines of a tool result shown unless ``/verbose`` is on."""
+FAILED_LINE = "failed, trying a different approach (/verbose shows why)"
+"""What a failed tool call shows unless ``/verbose`` is on: the error is written for the model,
+which reads it and adjusts (the web UI says the same). A declined approval keeps its own lines."""
 ARG_PREVIEW_CHARS = 60
 THINKING_PREVIEW_CHARS = 100
 REFRESH_PER_SECOND = 8
@@ -647,7 +650,11 @@ class Renderer:
 
     def _result(self, event: Mapping[str, Any]) -> None:
         content = str(event.get("content") or "")
-        style = "dim red" if event.get("is_error") else "dim"
+        failed = bool(event.get("is_error"))
+        if failed and not self.verbose and REJECT_MESSAGE not in content:
+            self.console.print(Text(f"   {FAILED_LINE}", style="dim"))
+            return
+        style = "dim red" if failed else "dim"
         lines = content.splitlines() or [""]
         shown = lines if self.verbose else lines[:RESULT_PREVIEW_LINES]
         width = max(self.console.width - 6, 20)

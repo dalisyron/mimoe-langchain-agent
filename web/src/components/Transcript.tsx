@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { AssistantTurn, Turn } from '../reducer';
+import { isRetrying } from '../steps';
 import { Markdown } from './Markdown';
 import { Thinking } from './Thinking';
 import { ToolCard } from './ToolCard';
@@ -53,7 +54,7 @@ function Assistant({ turn, live }: { turn: AssistantTurn; live: boolean }) {
         switch (b.kind) {
           case 'thinking': return <Thinking key={j} text={b.text} live={live && j === last} />;
           case 'text': return <Markdown key={j} text={b.text} />;
-          case 'tool': return <ToolCard key={j} block={b} />;
+          case 'tool': return <ToolCard key={j} block={b} retrying={isRetrying(turn.blocks, j, live)} />;
           case 'notice': return <div key={j} className="notice">{b.text}</div>;
           case 'error': return <div key={j} className="error">{b.message}{b.hint && <div className="hint">{b.hint}</div>}</div>;
         }

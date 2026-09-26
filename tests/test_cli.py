@@ -214,6 +214,22 @@ def test_tool_round_trip_is_rendered_and_truncated(run: Run, fake_mimoe: FakeMim
     assert "2 model calls" in second
 
 
+def test_a_failed_tool_call_is_one_line_until_verbose(run: Run, fake_mimoe: FakeMimoe) -> None:
+    """The error is for the model, which reads it and adjusts; the reader gets one plain line."""
+    code = {"tool_calls": [{"name": "calculator", "args": {"expression": "sum(range(10))"}}]}
+    script(fake_mimoe, code, {"content": "Counted."}, code, {"content": "Again."})
+    result = run(input="count\n/verbose\ncount\n/quit\n")
+    assert result.exit_code == 0
+    first, second = result.output.split("verbose on")
+    assert "-> calculator(expression='sum(range(10))')" in first
+    assert f"   {cli.FAILED_LINE}" in first and "Counted." in first
+    assert "unknown function 'range'" not in first
+    assert "ERROR: unknown function 'range'" in second and cli.FAILED_LINE not in second
+    assert (
+        "call run_python" in _tool_messages(fake_mimoe)[-1]["content"]
+    )  # the model still reads why
+
+
 def test_empty_answer_message(run: Run, fake_mimoe: FakeMimoe) -> None:
     script(fake_mimoe, {"content": ""})
     result = run(input="hi\n/quit\n")
@@ -278,6 +294,7 @@ def test_approval_no_denies_and_tells_the_model(run: Run, fake_mimoe: FakeMimoe)
     assert result.exit_code == 0
     assert "not executed; the model is told the code did not run" in result.output
     assert "I did not run the code." in result.output
+    assert cli.FAILED_LINE not in result.output  # a denial is the user's decision, not a failure
     tool = _tool_messages(fake_mimoe)[0]
     assert "not executed" in tool["content"] and REJECT_MESSAGE in tool["content"]
     assert "stdout" not in tool["content"]

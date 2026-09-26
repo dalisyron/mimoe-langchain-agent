@@ -53,16 +53,17 @@ button:disabled { opacity: .5; cursor: default; }
 pre { background: color-mix(in srgb, var(--bg) 70%, var(--panel)); border-radius: 8px; padding: 10px; overflow-x: auto; font-size: 13px; margin: 8px 0; }
 code { font-size: 13px; }
 table { border-collapse: collapse; } td, th { border: 1px solid var(--border); padding: 4px 8px; }
-.thinking, .tool { border: 1px dashed var(--border); border-radius: 8px; padding: 6px 10px; margin: 8px 0; font-size: 13px; }
-.thinking summary, .tool summary { color: var(--muted); cursor: pointer; }
+/* thinking and tool steps: one muted line each; the details open on click */
+.thinking, .step { margin: 6px 0; font-size: 13px; color: var(--muted); }
+.thinking summary, .step summary { cursor: pointer; width: fit-content; }
+.thinking summary:hover, .step summary:hover { color: var(--text); }
 .thinking pre { white-space: pre-wrap; }
+.step-running summary::after { content: ""; display: inline-block; width: 8px; height: 8px; margin-left: 8px; vertical-align: -1px; border: 2px solid var(--muted); border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
+.step-awaiting_approval summary { color: var(--text); }
+.step-detail { margin: 4px 0 8px 16px; }
+.step-detail pre { margin: 6px 0; }
+.step .result { max-height: 280px; overflow: auto; white-space: pre-wrap; }
 .tool-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.tool pre { margin: 6px 0; }
-.tool .result { max-height: 280px; overflow: auto; white-space: pre-wrap; }
-.tool-running .chip { background: color-mix(in srgb, var(--accent) 20%, transparent); }
-.tool-awaiting_approval .chip { background: color-mix(in srgb, var(--warn) 30%, transparent); }
-.tool-done .chip { background: color-mix(in srgb, var(--ok) 25%, transparent); }
-.tool-error .chip, .tool-denied .chip { background: color-mix(in srgb, var(--bad) 25%, transparent); }
 .notice { color: var(--warn); font-size: 13px; border-left: 3px solid var(--warn); padding: 4px 8px; margin: 8px 0; }
 .error { border: 1px solid var(--bad); color: var(--bad); border-radius: 8px; padding: 8px 12px; margin: 8px 0; white-space: pre-wrap; }
 .stats { color: var(--muted); font-size: 12px; margin-top: 6px; }
