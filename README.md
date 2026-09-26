@@ -199,7 +199,7 @@ Two lines of LangGraph vocabulary, since `create_agent` compiles to a LangGraph 
 | React + Vite + TypeScript with the built bundle committed in `web/dist` | The reviewer needs no Node.js; the UI is about 750 lines with no UI kit, and the reducer, SSE parser and stream consumer have vitest tests. | Streamlit or Gradio: fast to start, but the per-turn tool cards, the approval panel with one decision per request, Stop and resume did not fit their request/rerun model. |
 | uv | One command installs Python 3.13 and the locked dependencies on macOS, Windows and Linux; `uv run mimoe-agent` is the whole quickstart. | pip or poetry: pip needs a Python 3.13 and a venv first; poetry is one more tool to install. |
 | Plain `@tool` functions, with pandas available to `run_python` | Eight ordinary functions whose docstrings are the descriptions the model reads; pandas because the model reaches for it every time and gets CSVs right (my csv-module fallback miscounted the header row). | RAG, a vector store or SQLite: the workspace is small, `read_file`/`search_files`/`run_python` answer everything, and an index is more setup, more dependencies and one more thing that can be stale. |
-| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 707 tests run on CI without Studio; five live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
+| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 711 tests run on CI without Studio; six live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
 | Python 3.13 as the floor | The workspace jail uses `ntpath.isreserved` (new in 3.13) and `Path.is_junction` (3.12) for Windows; uv installs 3.13 anyway. | Supporting 3.10 to 3.12 with fallbacks: more code paths to test on Windows for no benefit to the reviewer. |
 
 ## How the components connect
@@ -492,8 +492,9 @@ What `run_python` does to keep accidents small (none of it is a sandbox):
 The other tools:
 
 - `list_files`, `read_file`, `search_files` are jailed to the workspace: `..`, absolute paths,
-  drive letters, UNC paths, symlinks and junctions that point outside, and reserved Windows names
-  are refused; listing and searching skip `.git`, `node_modules`, `.venv` and similar; credential
+  drive letters and UNC paths outside it, symlinks and junctions that point outside, and reserved
+  Windows names are refused (an absolute path inside the workspace, which the model copies from the
+  system prompt, counts as the relative path it names); listing and searching skip `.git`, `node_modules`, `.venv` and similar; credential
   files (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `credentials`, `.netrc`, `token.json` and
   similar, matched after Unicode normalisation and case folding) are refused, as are binaries and
   files over 2 MB. The jail is by path, so a workspace's `.git/config` is readable by `read_file`,
@@ -554,8 +555,8 @@ hint is on stderr), 130 for Ctrl-C at the prompt. Piped input works
 
 ```bash
 uv sync                                   # dependencies plus the dev group
-uv run pytest -q                          # 707 offline tests against the fake engine, no Studio needed
-MIMOE_LIVE=1 uv run pytest -m live        # 5 live tests against a running Studio (a handful of completions)
+uv run pytest -q                          # 711 offline tests against the fake engine, no Studio needed
+MIMOE_LIVE=1 uv run pytest -m live        # 6 live tests against a running Studio (a handful of completions)
 uvx ruff check . && uvx ruff format --check .
 cd web && npm ci && npm test && npm run build   # 35 vitest tests; the build writes web/dist
 ```
@@ -606,6 +607,7 @@ Things the assistant got wrong that tests or reviews caught:
 | The git tests inherited `GIT_DIR` and `GIT_INDEX_FILE`. A reviewing agent confirmed it by running the suite from a pre-commit hook in a linked worktree; each test commit fired the hook again, the processes multiplied and my laptop stopped responding until I forced a restart | Traced afterwards from the agents' transcripts. The tests and the git tool now drop inherited `GIT_*` variables, the git tool runs no repository hooks or filters, `run_python` got its 2 GB memory cap, and the remaining agents ran under explicit resource rules |
 | A calculator error that named the refused syntax (`unsupported syntax: GeneratorExp`) but not the tool to use instead, on a call the web UI showed as done because only exceptions counted as failures. Asked how many primes lie between 1000 and 4500, qwen3-4b-instruct-2507 sent the same expression again and then answered 543 "after checking known prime distribution data" (there are 442) | My own session in the web UI, then replayed from the engine log with the exact messages: with the old error the model resent the call in 3 of 3 runs, with an error that names `run_python` it switched to `run_python` in 3 of 3. The calculator's description now says what it cannot run, its errors point to `run_python`, a result that reports a failure shows as failed in both interfaces, and a live test replays the step |
 | A system-prompt rule, "Only state numbers that appear in a tool result", that qwen3-4b-instruct-2507 did not take as a reason to call a tool. Asked for the sum of the multiples of 5 between 432 and 43229, it worked the series out in text and answered 186,000,000 (the sum is 186,842,970) | My own session, then first-step replays of about twenty questions under five prompt wordings: with the old rule the model did 6 of 8 number questions in its head, four of them wrong. The rule now says never to do arithmetic in your head and names `calculator` and `run_python`: 7 of 8 go to a tool, questions about facts and the workspace get the same tools as before, and a live test replays the question. A longer rule that listed sums, averages and percentages did worse (4 of 10) |
+| The arithmetic rule above was checked on which tool the model picked, not on its arguments. With it, "Show me the list of files in my workspace" made qwen3-4b-instruct-2507 pass the workspace's absolute path from the system prompt, which the file tools refused, so the listing took a second call | My own session. A replay of six "my workspace" questions showed the switch (the old prompt sent `.`, and `/` for one wording). The jail now takes an absolute path inside the workspace as the relative path it names, and a live test asks the question on the sample workspace and runs the call the model makes |
 
 Every design decision described above was mine to approve: the assistant proposed, I chose, and
 a diff I could not explain did not go in.

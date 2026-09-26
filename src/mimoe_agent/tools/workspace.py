@@ -1,7 +1,8 @@
 """Workspace jail and the read-only file tools: ``list_files``, ``read_file``, ``search_files``.
 
 Every path a tool receives is resolved against the workspace root and refused when it escapes
-(``..``, absolute paths, drive letters, UNC shares, symlinks or junctions that point outside).
+(``..``, absolute paths, drive letters or UNC shares outside the root, symlinks or junctions that
+point outside).
 The tools return strings, never raise and never return ``""``; error strings start with
 ``error:`` so the model can react to them. Outputs stay within 8,000 characters so the
 ``[truncated ...]`` tails and ``offset=N`` hints survive the middleware result cap.
@@ -130,22 +131,32 @@ class Workspace:
         The path does not have to exist. Symlinks and junctions are followed before the
         containment check, so a link that points outside the workspace is refused.
 
+        An absolute path under the root (the model copies the root from the system prompt) counts
+        as the relative path it names and goes through the same checks.
+
         Raises:
-            WorkspaceError: the path contains a NUL, is absolute, uses a drive letter or a UNC
-                share, resolves outside the root, or (on Windows) names a reserved device.
+            WorkspaceError: the path contains a NUL, is absolute or uses a drive letter or a UNC
+                share outside the root, resolves outside the root, or (on Windows) names a
+                reserved device.
         """
         text = str(rel).strip() or "."
         if "\x00" in text:
             raise WorkspaceError("path contains a NUL character")
+        relative = text
         # Path.__truediv__ silently replaces the root with an absolute, rooted, drive-relative
-        # or UNC operand, so those are rejected before joining, in both path flavours.
+        # or UNC operand, so those never reach a join (or the filesystem: resolving a UNC path
+        # connects to its server); only the lexical part below the root is kept.
         if PurePosixPath(text).anchor or PureWindowsPath(text).anchor:
-            raise WorkspaceError(
-                f"absolute paths, drive letters and UNC shares are not allowed: {text!r}; "
-                "use a path relative to the workspace"
-            )
+            inside = self._below_root(text)
+            if inside is None:
+                raise WorkspaceError(
+                    "absolute paths outside the workspace, drive letters and UNC shares are not "
+                    f"allowed: {text!r}; use a path relative to the workspace, such as '.' for "
+                    "the workspace itself"
+                )
+            relative = inside
         try:
-            candidate = (self.root / text).resolve(strict=False)
+            candidate = (self.root / relative).resolve(strict=False)
         except (OSError, RuntimeError, ValueError) as exc:  # symlink loop, too long, odd bytes
             raise WorkspaceError(f"invalid path {text!r}: {exc}") from exc
         if not candidate.is_relative_to(self.root):
@@ -153,6 +164,19 @@ class Workspace:
         if _WINDOWS and ntpath.isreserved(str(candidate)):  # CON, NUL, COM1, "name.", "name "
             raise WorkspaceError(f"reserved Windows device name: {text!r}")
         return candidate
+
+    def _below_root(self, text: str) -> str | None:
+        """The part of an absolute path below the root, or ``None`` when it is not under it.
+
+        Lexical only: ``..`` stays in the result for :meth:`resolve` to judge. Windows paths
+        compare case-insensitively with either separator; a rooted path without a drive, a
+        drive-relative path and a UNC share outside the root are never under it.
+        """
+        flavour = PureWindowsPath if _WINDOWS else PurePosixPath
+        path, root = flavour(text), flavour(self.root)
+        if not path.is_absolute() or not path.is_relative_to(root):
+            return None
+        return path.relative_to(root).as_posix()
 
     def rel(self, path: Path) -> str:
         """Workspace-relative POSIX form of an absolute path inside the root, for display."""

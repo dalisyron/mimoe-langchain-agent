@@ -153,6 +153,43 @@ class TestWorkspaceJail:
         with pytest.raises(WorkspaceError):
             ws.resolve(rel)
 
+    def test_absolute_paths_under_the_root_are_accepted(self, ws: Workspace) -> None:
+        """The model copies the root from the system prompt: qwen3-4b-instruct-2507 answered
+        "Show me the list of files in my workspace" with list_files(path=<the root>)."""
+        root = ws.root
+        assert ws.resolve(str(root)) == root
+        assert ws.resolve(root.as_posix()) == root  # the system prompt's spelling, also on Windows
+        assert ws.resolve(root.as_posix() + "/") == root
+        assert ws.resolve(str(root / "notes.md")) == root / "notes.md"
+        assert ws.resolve(root.as_posix() + "/src/app.py") == root / "src" / "app.py"
+        assert ws.resolve(str(root / "src" / ".." / "notes.md")) == root / "notes.md"
+
+    def test_absolute_paths_are_still_jailed(
+        self, ws: Workspace, root: Path, tmp_path: Path
+    ) -> None:
+        with pytest.raises(WorkspaceError, match="escapes"):
+            ws.resolve(str(ws.root / ".." / "x"))  # under the root lexically, outside once resolved
+        sibling = Path(str(ws.root) + "2")  # shares the root's spelling as a prefix
+        for outside in (ws.root.parent, sibling, sibling / "notes.md"):
+            with pytest.raises(WorkspaceError, match="outside the workspace.*'\\.' for"):
+                ws.resolve(str(outside))
+        (tmp_path / "outside").mkdir()
+        symlink_or_skip(tmp_path / "outside", root / "link_dir")
+        with pytest.raises(WorkspaceError, match="escapes"):
+            ws.resolve(str(ws.root / "link_dir"))
+
+    @pytest.mark.skipif(not WINDOWS, reason="Windows path rules")
+    def test_windows_absolute_paths_under_the_root(self, ws: Workspace) -> None:
+        root, drive = str(ws.root), ws.root.drive
+        assert ws.resolve(root.upper() + "\\notes.md") == ws.root / "notes.md"  # any case
+        assert ws.resolve(root.replace("\\", "/") + "/src/app.py") == ws.root / "src" / "app.py"
+        for bad in (
+            drive + "notes.md",
+            root[len(drive) :] + "\\notes.md",
+        ):  # drive-relative, rooted
+            with pytest.raises(WorkspaceError):
+                ws.resolve(bad)
+
     def test_symlink_escapes_rejected(self, ws: Workspace, root: Path, tmp_path: Path) -> None:
         outside = tmp_path / "outside"
         outside.mkdir()
@@ -242,6 +279,15 @@ class TestToolWiring:
             out = tools[name].invoke(args)
             assert isinstance(out, str)
             assert out.startswith("error:")
+
+    def test_tools_take_the_absolute_workspace_path(self, ws: Workspace, tools: Tools) -> None:
+        """What the model sends when a question says "my workspace" (see the jail tests)."""
+        listing = list_(tools, path=ws.root.as_posix())
+        assert not listing.startswith("error:") and "src/app.py" in listing
+        assert "TODO: one" in read(tools, str(ws.root / "notes.md"))
+        assert "notes.md" in search(tools, "todo", path=str(ws.root))
+        refused = list_(tools, path="/")  # the filesystem root is not the workspace
+        assert refused.startswith("error:") and "'.' for the workspace itself" in refused
 
     def test_numeric_strings_are_coerced(self, root: Path, tools: Tools) -> None:
         write(root, "long.txt", "".join(f"line {i}\n" for i in range(1, 21)))

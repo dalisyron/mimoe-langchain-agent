@@ -159,7 +159,7 @@ text; `ThinkSplitter` (stateful, per model call) turns both into `thinking` even
 ```python
 def build_tools(settings: Settings, client: MimoeClient | None = None) -> list[BaseTool]
 # workspace.py
-class Workspace:  __init__(root: Path); resolve(rel: str) -> Path  (raises WorkspaceError on escape)
+class Workspace:  __init__(root: Path); resolve(rel: str) -> Path  (an absolute path under the root counts as the relative path it names; raises WorkspaceError on escape)
 def make_workspace_tools(ws: Workspace) -> list[BaseTool]     # list_files, read_file, search_files
 # run_python.py
 def make_run_python(ws: Workspace, *, allow_network: bool, timeout_s: float = 30.0, memory_limit_mb: int = MEMORY_LIMIT_MB) -> BaseTool
