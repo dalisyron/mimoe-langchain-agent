@@ -25,6 +25,7 @@ from mimoe_agent.middleware import (
     GuardrailMiddleware,
     QwenMiddleware,
     clean_ai_message,
+    reports_failure,
     split_think,
 )
 from mimoe_agent.mimoe import MimoeClient, preflight
@@ -409,3 +410,38 @@ async def test_agent_trims_old_tool_messages_but_keeps_the_checkpoint(
         m for m in agent.get_state(CFG).values["messages"] if isinstance(m, ToolMessage)
     )
     assert checkpointed.content == "m" * 5000
+
+
+# -- results that report a failure -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("content", "failed"),
+    [
+        ("ERROR: division by zero.", True),
+        ("error: no such file: notes.txt", True),
+        ("  ERROR: leading space", True),
+        ("exit_code: 1\nstdout: (empty)\nstderr:\nTraceback (most recent call last)", True),
+        ("exit_code: -9 (killed: timed out after 30 s)\nstdout: (empty)", True),
+        ("exit_code: 0 (killed: cancelled by the user; do not run it again unless asked)", True),
+        ("exit_code: 0\nstdout:\n42\nstderr: (empty)", False),
+        ("errors.txt  (12 B)\nnotes.md  (307 B)", False),
+        ("442", False),
+        ("", False),
+    ],
+)
+def test_reports_failure(content: str, failed: bool) -> None:
+    assert reports_failure(content) is failed
+
+
+def test_reported_failures_are_marked_as_errors_and_nothing_else_changes() -> None:
+    """Tools return their errors as text; the status is what the web UI and the terminal use to
+    show the call as failed (red) instead of done. The model only reads the text."""
+    mark = GuardrailMiddleware.mark_failure
+    failed = mark(ToolMessage("ERROR: nope", tool_call_id="t1", name="calculator"))
+    fine = mark(ToolMessage("442", tool_call_id="t2", name="calculator"))
+    assert isinstance(failed, ToolMessage) and failed.status == "error"
+    assert failed.content == "ERROR: nope" and failed.tool_call_id == "t1"
+    assert isinstance(fine, ToolMessage) and fine.status == "success"
+    command = Command(update={})
+    assert mark(command) is command

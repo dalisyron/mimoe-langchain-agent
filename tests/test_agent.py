@@ -16,6 +16,7 @@ from mimoe_agent.config import Settings, load_settings
 from mimoe_agent.llm import MimoeChatOpenAI, make_model
 from mimoe_agent.middleware import REASONING_KEY
 from mimoe_agent.mimoe import MimoeClient, Preflight, preflight
+from mimoe_agent.stream import aiter_events, iter_events
 from mimoe_agent.tools import TOOL_NAMES, build_tools
 
 CFG = {"configurable": {"thread_id": "t1"}}
@@ -340,3 +341,41 @@ async def test_v10_thinking_answer_is_checkpointed_without_leading_whitespace(
     assert final.content == "7 times 8 is 56."  # the checkpoint matches the 0.6 path
     assert final.additional_kwargs[REASONING_KEY] == "seven times eight"
     assert fake.calls[-1]["enable_thinking"] is True
+
+
+# -- a refused calculator call ------------------------------------------------------------------
+
+PRIMES = "sum(1 for n in range(1000, 4501) if all(n % i != 0 for i in range(2, int(n**0.5) + 1)))"
+PRIMES_CALL = {"tool_calls": [{"name": "calculator", "args": {"expression": PRIMES}}]}
+
+
+def _check_refused_calculator(events: list[dict[str, Any]], agent: Any, fake: FakeMimoe) -> None:
+    result = next(e for e in events if e["event"] == "tool_result")
+    assert result["name"] == "calculator" and result["is_error"] is True
+    assert "call run_python with code that prints the result" in result["content"]
+    messages = agent.get_state(CFG).values["messages"]
+    tool_message = next(m for m in messages if isinstance(m, ToolMessage))
+    assert tool_message.status == "error"
+    sent = fake.calls[-1]["messages"][-1]  # what the model read before its next step
+    assert sent["role"] == "tool" and "call run_python" in sent["content"]
+
+
+def test_a_refused_calculator_call_is_shown_as_failed_and_points_to_run_python(
+    fake_mimoe: FakeMimoe, settings_tmp: Settings
+) -> None:
+    """The prime-number turn from a real web session: the call used to show as done."""
+    agent, _ = _build(fake_mimoe, settings_tmp)
+    fake_mimoe.script(PRIMES_CALL, {"content": "I will count them with run_python."})
+    payload = {"messages": [HumanMessage("How many primes are there between 1000 and 4500?")]}
+    _check_refused_calculator(list(iter_events(agent, payload, CFG)), agent, fake_mimoe)
+
+
+async def test_a_refused_calculator_call_is_shown_as_failed_async(
+    fake_mimoe: FakeMimoe, settings_tmp: Settings
+) -> None:
+    """Same through the async path the web server uses (``awrap_tool_call``)."""
+    agent, _ = _build(fake_mimoe, settings_tmp)
+    fake_mimoe.script(PRIMES_CALL, {"content": "I will count them with run_python."})
+    payload = {"messages": [HumanMessage("How many primes are there between 1000 and 4500?")]}
+    events = [e async for e in aiter_events(agent, payload, CFG)]
+    _check_refused_calculator(events, agent, fake_mimoe)

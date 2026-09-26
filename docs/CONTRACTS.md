@@ -125,7 +125,9 @@ inline think text to `additional_kwargs["reasoning_content"]` (append if the ser
 and strip it from `content`; if `invalid_tool_calls` and no `tool_calls`, replace the message with
 `AIMessage(content="I produced a malformed tool call; please rephrase.")` and clear
 `invalid_tool_calls`. GuardrailMiddleware: `before_agent` resets `thread_model_call_count`;
-`wrap_tool_call`/`awrap_tool_call` cap results and convert exceptions to `ToolMessage(status="error")`;
+`wrap_tool_call`/`awrap_tool_call` cap results, convert exceptions to `ToolMessage(status="error")`
+and set `status="error"` on a returned result that `reports_failure` (it starts with `ERROR:`, or its
+first line is `exit_code:` with a non-zero code or a `(killed:` note); the content is unchanged;
 model hooks shorten ToolMessages older than the current turn to `old_result_cap` chars in the
 request only.
 

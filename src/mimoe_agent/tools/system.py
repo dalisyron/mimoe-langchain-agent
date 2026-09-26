@@ -163,6 +163,43 @@ _FUNCTIONS: dict[str, Callable[..., Any]] = {
 _CONSTANTS: dict[str, float] = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf}
 
 
+RUN_PYTHON_HINT = (
+    "For counting, loops or anything beyond one arithmetic expression, call run_python with "
+    "code that prints the result"
+)
+"""Appended to every rejection that means "this is code, not arithmetic". A small model that
+only reads "unsupported syntax" tends to resend the same expression and then guess a number;
+naming the tool that can do it sends it to run_python instead (measured on
+qwen3-4b-instruct-2507)."""
+
+_CODE_SYNTAX: tuple[tuple[type[ast.AST], str], ...] = (
+    (ast.GeneratorExp, "a generator expression"),
+    (ast.ListComp, "a list comprehension"),
+    (ast.SetComp, "a set comprehension"),
+    (ast.DictComp, "a dict comprehension"),
+    (ast.Lambda, "a lambda"),
+    (ast.IfExp, "a conditional expression"),
+    (ast.Compare, "a comparison"),
+    (ast.BoolOp, "and/or logic"),
+    (ast.Subscript, "indexing"),
+    (ast.Attribute, "attribute access"),
+    (ast.NamedExpr, "an assignment"),
+    (ast.JoinedStr, "an f-string"),
+    (ast.Starred, "unpacking"),
+)
+
+
+def _not_arithmetic(node: ast.AST) -> ValueError:
+    """The rejection for syntax the calculator does not evaluate, pointing at run_python."""
+    what = next((label for kind, label in _CODE_SYNTAX if isinstance(node, kind)), None)
+    if what is None:
+        return ValueError(f"unsupported syntax: {type(node).__name__}. {RUN_PYTHON_HINT}")
+    return ValueError(
+        f"the calculator evaluates one arithmetic expression; it cannot run {what} (loops, "
+        f"comprehensions and conditions are Python code). {RUN_PYTHON_HINT}"
+    )
+
+
 def _eval_node(node: ast.AST) -> Any:
     """Evaluate one whitelisted AST node; anything else raises ``ValueError``."""
     if isinstance(node, ast.Constant):
@@ -174,8 +211,8 @@ def _eval_node(node: ast.AST) -> Any:
         if node.id in _CONSTANTS:
             return _CONSTANTS[node.id]
         raise ValueError(
-            f"unknown name {node.id!r}; only numbers, operators and functions such as "
-            "sqrt(), round() or log() are allowed"
+            f"unknown name {node.id!r}; the calculator has no variables, only numbers, operators "
+            f"and functions such as sqrt(), round() or log(). {RUN_PYTHON_HINT}"
         )
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
         return _UNARY_OPS[type(node.op)](_eval_node(node.operand))
@@ -190,7 +227,7 @@ def _eval_node(node: ast.AST) -> Any:
         return _check_size(_eval_call(node))
     if isinstance(node, ast.Tuple):
         raise ValueError("commas are not allowed; write 1000 instead of 1,000")
-    raise ValueError(f"unsupported syntax: {type(node).__name__}")
+    raise _not_arithmetic(node)
 
 
 def _eval_call(node: ast.Call) -> Any:
@@ -202,10 +239,15 @@ def _eval_call(node: ast.Call) -> Any:
     elif isinstance(func, ast.Name):
         name = func.id
     else:
-        raise ValueError("only plain function calls such as sqrt(2) are allowed")
+        raise ValueError(
+            f"only plain function calls such as sqrt(2) are allowed. {RUN_PYTHON_HINT}"
+        )
     apply = _FUNCTIONS.get(name)
     if apply is None:
-        raise ValueError(f"unknown function {name!r}; available: {', '.join(sorted(_FUNCTIONS))}")
+        raise ValueError(
+            f"unknown function {name!r}; available: {', '.join(sorted(_FUNCTIONS))}. "
+            f"{RUN_PYTHON_HINT}"
+        )
     if node.keywords:
         raise ValueError(f"{name}() takes positional arguments only")
     return apply(*[_eval_argument(argument) for argument in node.args])
@@ -287,9 +329,11 @@ def calculate(expression: str) -> str:
 
 @tool
 def calculator(expression: str) -> str:
-    """Evaluate an arithmetic expression in Python syntax (e.g. '1836.6 * 0.15', 'sqrt(2) + 2**10')
+    """Evaluate one arithmetic expression in Python syntax (e.g. '1836.6 * 0.15', 'sqrt(2) + 2**10')
     and return the number. Only numbers, + - * / // % **, parentheses and math functions such as
-    sqrt, log, round, min, max, factorial are allowed; use ** for powers, not ^."""
+    sqrt, log, round, min, max, factorial are allowed; use ** for powers, not ^. It cannot run
+    loops, comprehensions, conditions, range() or variables: for counting, loops or anything over
+    many values, use run_python."""
     return calculate(expression)
 
 

@@ -44,6 +44,23 @@ OLD_RESULT_TAIL = "[older tool output trimmed]"
 ERROR_DETAIL_CAP = 2_000
 """Characters of an exception message kept in the error ``ToolMessage``."""
 
+_EXIT_CODE_RE = re.compile(r"exit_code: (\S+)")
+
+
+def reports_failure(content: str) -> bool:
+    """Whether a tool's text result says the call failed.
+
+    The tools return ``ERROR: ...`` (the workspace tools ``error: ...``) instead of raising, so
+    the model can read what went wrong and the loop continues; ``run_python`` starts its result
+    with ``exit_code: N``, and anything but a clean 0 is a failed or killed run.
+    """
+    head = content.lstrip()
+    if head[:6].lower() == "error:":
+        return True
+    first_line = head.split("\n", 1)[0]
+    match = _EXIT_CODE_RE.match(first_line)
+    return bool(match) and (match.group(1) != "0" or "(killed:" in first_line)
+
 
 def split_think(text: str) -> tuple[str, str]:
     """Split a leading ``<think>`` block off ``text``.
@@ -177,7 +194,9 @@ class GuardrailMiddleware(AgentMiddleware[ModelCallLimitState[Any], Any, Any]):
     * ``wrap_tool_call`` / ``awrap_tool_call`` cap every string tool result at ``result_cap``
       characters with a ``[truncated: N chars total; use offset/limit]`` tail and turn any
       exception raised by a tool into a ``ToolMessage(status="error")`` so the loop continues.
-      LangGraph control-flow signals (interrupts) propagate untouched.
+      A result whose text reports a failure (:func:`reports_failure`) is marked
+      ``status="error"`` too, so the clients show it as failed; the model only ever sees the
+      text. LangGraph control-flow signals (interrupts) propagate untouched.
     * ``wrap_model_call`` / ``awrap_model_call`` shorten ``ToolMessage``s from earlier turns (before
       the latest ``HumanMessage``) to ``old_result_cap`` characters in the request only; the
       checkpoint keeps the full text.
@@ -228,6 +247,18 @@ class GuardrailMiddleware(AgentMiddleware[ModelCallLimitState[Any], Any, Any]):
         return result.model_copy(update={"content": f"{result.content[: self.result_cap]}\n{tail}"})
 
     @staticmethod
+    def mark_failure(result: ToolMessage | Command[Any]) -> ToolMessage | Command[Any]:
+        """Set ``status="error"`` on a ``ToolMessage`` whose text reports a failure."""
+        if (
+            isinstance(result, ToolMessage)
+            and result.status != "error"
+            and isinstance(result.content, str)
+            and reports_failure(result.content)
+        ):
+            return result.model_copy(update={"status": "error"})
+        return result
+
+    @staticmethod
     def error_message(request: ToolCallRequest, exc: BaseException) -> ToolMessage:
         """Build the error ``ToolMessage`` for an exception raised by a tool."""
         name = request.tool.name if request.tool is not None else request.tool_call["name"]
@@ -244,9 +275,9 @@ class GuardrailMiddleware(AgentMiddleware[ModelCallLimitState[Any], Any, Any]):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
-        """Sync hook: run the tool, cap its result, convert exceptions."""
+        """Sync hook: run the tool, cap its result, flag reported failures, convert exceptions."""
         try:
-            return self.cap_result(handler(request))
+            return self.mark_failure(self.cap_result(handler(request)))
         except GraphBubbleUp:
             raise
         except Exception as exc:
@@ -259,7 +290,7 @@ class GuardrailMiddleware(AgentMiddleware[ModelCallLimitState[Any], Any, Any]):
     ) -> ToolMessage | Command[Any]:
         """Async hook: same as :meth:`wrap_tool_call`."""
         try:
-            return self.cap_result(await handler(request))
+            return self.mark_failure(self.cap_result(await handler(request)))
         except GraphBubbleUp:
             raise
         except Exception as exc:

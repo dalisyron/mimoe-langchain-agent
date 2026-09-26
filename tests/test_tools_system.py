@@ -163,6 +163,36 @@ def test_calculator_caret_hint() -> None:
     assert calculate("10^10**10").startswith("ERROR: '^'")  # the hint wins over the bomb check
 
 
+PRIMES = "sum(1 for n in range(1000, 4501) if all(n % i != 0 for i in range(2, int(n**0.5) + 1)))"
+
+
+@pytest.mark.parametrize(
+    ("expression", "what"),
+    [
+        (PRIMES, "it cannot run a generator expression"),
+        ("[n * 2 for n in (1, 2)]", "it cannot run a list comprehension"),
+        ("1 if 2 > 1 else 0", "it cannot run a conditional expression"),
+        ("3 > 2", "it cannot run a comparison"),
+        ("range(10)", "unknown function 'range'"),
+        ("n * 2", "unknown name 'n'; the calculator has no variables"),
+        ("x.real", "it cannot run attribute access"),
+    ],
+)
+def test_calculator_sends_code_to_run_python(expression: str, what: str) -> None:
+    """Code is refused with a pointer to run_python: with the bare "unsupported syntax:
+    GeneratorExp" qwen3-4b resent the same expression and then guessed a number."""
+    out = calculate(expression)
+    assert out.startswith("ERROR: ") and what in out
+    assert "call run_python with code that prints the result" in out
+
+
+def test_calculator_description_says_what_it_cannot_do() -> None:
+    description = " ".join(calculator.description.split())  # the docstring wraps lines
+    assert "cannot run loops, comprehensions, conditions, range() or variables" in description
+    assert "use run_python" in description
+    assert calculate("2**10 + sqrt(16)") == "1028"  # arithmetic is unchanged
+
+
 @pytest.mark.parametrize("expression", ["1/0", "5 % 0", "7 // 0", "1 / (2 - 2)"])
 def test_calculator_division_by_zero(expression: str) -> None:
     assert calculate(expression) == "ERROR: division by zero."

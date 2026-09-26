@@ -196,7 +196,7 @@ Two lines of LangGraph vocabulary, since `create_agent` compiles to a LangGraph 
 | React + Vite + TypeScript with the built bundle committed in `web/dist` | The reviewer needs no Node.js; the UI is about 750 lines with no UI kit, and the reducer, SSE parser and stream consumer have vitest tests. | Streamlit or Gradio: fast to start, but the per-turn tool cards, the approval panel with one decision per request, Stop and resume did not fit their request/rerun model. |
 | uv | One command installs Python 3.13 and the locked dependencies on macOS, Windows and Linux; `uv run mimoe-agent` is the whole quickstart. | pip or poetry: pip needs a Python 3.13 and a venv first; poetry is one more tool to install. |
 | Plain `@tool` functions, with pandas available to `run_python` | Eight ordinary functions whose docstrings are the descriptions the model reads; pandas because the model reaches for it every time and gets CSVs right (my csv-module fallback miscounted the header row). | RAG, a vector store or SQLite: the workspace is small, `read_file`/`search_files`/`run_python` answer everything, and an index is more setup, more dependencies and one more thing that can be stale. |
-| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 652 tests run on CI without Studio; two live smoke tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
+| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 705 tests run on CI without Studio; four live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
 | Python 3.13 as the floor | The workspace jail uses `ntpath.isreserved` (new in 3.13) and `Path.is_junction` (3.12) for Windows; uv installs 3.13 anyway. | Supporting 3.10 to 3.12 with fallbacks: more code paths to test on Windows for no benefit to the reviewer. |
 
 ## How the components connect
@@ -246,9 +246,10 @@ What each module does, in reading order:
 - `agent.py`: the system prompt and `build_agent`, which is one `create_agent(...)` call with four
   middleware in this order: `QwenMiddleware` (moves inline `<think>` text out of the answer, appends
   `/no_think` on 0.6 engines, neutralises a malformed tool call), `GuardrailMiddleware` (caps every
-  tool result at 8 KB, turns a tool exception into an error message the model can read, shortens
-  tool results from earlier turns to 400 characters in the request only, resets the per-turn
-  budget), `ModelCallLimitMiddleware(thread_limit=8)`, and `HumanInTheLoopMiddleware` on
+  tool result at 8 KB, turns a tool exception into an error message the model can read, marks a
+  result that reports a failure, such as `ERROR: ...` or a snippet that exited non-zero, as failed
+  so both interfaces show it in red, shortens tool results from earlier turns to 400 characters in
+  the request only, resets the per-turn budget), `ModelCallLimitMiddleware(thread_limit=8)`, and `HumanInTheLoopMiddleware` on
   `run_python` (omitted with `--auto-approve`).
 - `stream.py`: drives `agent.stream(..., stream_mode=["messages", "updates"])` and maps what
   LangGraph yields to neutral event dicts. Both clients use it, so the CLI and the web UI cannot
@@ -282,7 +283,7 @@ The HTTP API and the events (the full contract is in `docs/CONTRACTS.md`):
 |---|---|---|
 | `token`, `thinking` | `{text}` | answer text, reasoning text (shown collapsed) |
 | `tool_call` | `{id, name, args}` | the model asked for a tool |
-| `tool_result` | `{id, name, content, is_error}` | the tool answered, or the rejection |
+| `tool_result` | `{id, name, content, is_error}` | the tool answered, or the rejection; `is_error` when it failed |
 | `approval_required` | `{interrupt_id, action_requests, review_configs}` | `run_python` is waiting for you; followed by `done` |
 | `notice` | `{text}` | the model-call limit ended the turn |
 | `done` | `{status: completed or awaiting_approval, elapsed_s, model, usage_total}` | end of the run |
@@ -549,8 +550,8 @@ hint is on stderr), 130 for Ctrl-C at the prompt. Piped input works
 
 ```bash
 uv sync                                   # dependencies plus the dev group
-uv run pytest -q                          # 684 offline tests against the fake engine, no Studio needed
-MIMOE_LIVE=1 uv run pytest -m live        # 3 smoke tests against a running Studio (a handful of completions)
+uv run pytest -q                          # 705 offline tests against the fake engine, no Studio needed
+MIMOE_LIVE=1 uv run pytest -m live        # 4 live tests against a running Studio (a handful of completions)
 uvx ruff check . && uvx ruff format --check .
 cd web && npm ci && npm test && npm run build   # 29 vitest tests; the build writes web/dist
 ```
@@ -599,6 +600,7 @@ Things the assistant got wrong that tests or reviews caught:
 | Ctrl-C was meant to kill a running snippet, but LangGraph runs graph nodes on pool threads while it streams events, so the interrupt never reached the tool and the REPL froze until the step ended | The final review, reproduced with real SIGINTs under a pseudo-terminal. Each turn now runs on a worker thread with a cancel signal that kills the snippet and closes the model stream; tests interrupt the real REPL thread |
 | The approval prompt printed model-written code with raw terminal escapes, so a snippet could erase a line and show something other than what runs | The final review, reproduced with a hidden line that ran after approval. Output is escaped and the prompt warns in red |
 | The git tests inherited `GIT_DIR` and `GIT_INDEX_FILE`. A reviewing agent confirmed it by running the suite from a pre-commit hook in a linked worktree; each test commit fired the hook again, the processes multiplied and my laptop stopped responding until I forced a restart | Traced afterwards from the agents' transcripts. The tests and the git tool now drop inherited `GIT_*` variables, the git tool runs no repository hooks or filters, `run_python` got its 2 GB memory cap, and the remaining agents ran under explicit resource rules |
+| A calculator error that named the refused syntax (`unsupported syntax: GeneratorExp`) but not the tool to use instead, on a call the web UI showed as done because only exceptions counted as failures. Asked how many primes lie between 1000 and 4500, qwen3-4b-instruct-2507 sent the same expression again and then answered 543 "after checking known prime distribution data" (there are 442) | My own session in the web UI, then replayed from the engine log with the exact messages: with the old error the model resent the call in 3 of 3 runs, with an error that names `run_python` it switched to `run_python` in 3 of 3. The calculator's description now says what it cannot run, its errors point to `run_python`, a result that reports a failure shows as failed in both interfaces, and a live test replays the step |
 
 Every design decision described above was mine to approve: the assistant proposed, I chose, and
 a diff I could not explain did not go in.
