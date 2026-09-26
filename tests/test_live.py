@@ -1,9 +1,9 @@
 """Live smoke tests against a running mimOE Studio.
 
 Skipped unless ``MIMOE_LIVE=1`` (and selected with ``-m live``, which ``addopts`` excludes by
-default). Budget: at most nine completions in total: one REPL session with one prompt (probe +
-tool call + answer) and three replayed steps (probe + one completion each); the preflight test
-skips the probe with ``force_tools``.
+default). Budget: about fifteen completions in total: one REPL session with one prompt (probe +
+tool call + answer), three replayed steps (probe + one completion each) and two agent turns
+(probe + at most two completions each); the preflight test skips the probe with ``force_tools``.
 
 ``MIMOE_BASE_URL`` / ``MIMOE_API_KEY`` are read at import time because the autouse
 ``_clean_mimoe_env`` fixture strips every ``MIMOE_*`` variable before a test runs.
@@ -18,13 +18,15 @@ from typing import Any
 
 import pytest
 from conftest import REPO_WORKSPACE
+from langchain_core.messages import HumanMessage
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from typer.testing import CliRunner
 
-from mimoe_agent.agent import system_prompt
+from mimoe_agent.agent import build_agent, system_prompt
 from mimoe_agent.cli import app
 from mimoe_agent.config import Settings, load_settings
 from mimoe_agent.mimoe import EngineGeneration, MimoeClient, preflight
+from mimoe_agent.stream import iter_events
 from mimoe_agent.tools import build_tools
 from mimoe_agent.tools.system import calculate
 
@@ -182,3 +184,43 @@ def test_the_real_model_lists_my_workspace_on_the_first_call(tmp_path: Path) -> 
     args = json.loads(message["tool_calls"][0]["function"]["arguments"])
     result = {t.name: t for t in build_tools(settings)}["list_files"].invoke(args)
     assert not result.startswith("error:") and "notes.md" in result, (args, result)
+
+
+REMINDER = (
+    "Can you create a file called reminders and make an entry there, reminding me to water my "
+    "plants two days from now?"
+)
+
+
+def _turn(settings: Settings, question: str) -> list[dict[str, Any]]:
+    """One turn through the real agent and the event stream the CLI and web UI use. Approval is
+    on, so a run_python call stops at the approval request and no model-written code runs."""
+    client = MimoeClient(settings.base_url, settings.api_key)
+    try:
+        pre = preflight(settings, client=client)
+        agent = build_agent(settings, pre, tools=build_tools(settings, client))
+        payload = {"messages": [HumanMessage(question)]}
+        return list(iter_events(agent, payload, {"configurable": {"thread_id": "live"}}))
+    finally:
+        client.close()
+
+
+def test_the_real_agent_computes_a_small_sum_with_a_tool(workspace_tmp: Path) -> None:
+    """A real web-session question: the model answered 155 from memory (it is 165), arithmetic
+    rule or not; with the reminder after the question it calls a tool."""
+    settings = _settings(workspace_tmp, workspace_tmp.parent)
+    events = _turn(settings, "What is the sum of 10 to 20?")
+    calls = [event for event in events if event["event"] == "tool_call"]
+    assert calls and calls[0]["name"] in {"calculator", "run_python"}, events
+    assert "155" not in "".join(e["text"] for e in events if e["event"] == "token")
+
+
+def test_the_real_agent_offers_to_write_the_reminder(workspace_tmp: Path) -> None:
+    """A real web-session request the model refused ("I can't create or modify files directly in
+    the workspace as per your instructions"): it now proposes code that writes the file."""
+    events = _turn(_settings(workspace_tmp, workspace_tmp.parent), REMINDER)
+    approvals = [event for event in events if event["event"] == "approval_required"]
+    assert approvals, events
+    code = approvals[0]["action_requests"][0]["args"]["code"]
+    assert "reminders" in code and ("open(" in code or "write" in code), code
+    assert not list(workspace_tmp.glob("reminders*"))  # waiting for approval: nothing ran

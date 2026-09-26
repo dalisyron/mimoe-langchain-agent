@@ -14,7 +14,7 @@ from langgraph.types import Command
 from mimoe_agent.agent import APPROVAL_WARNING, build_agent, describe_run_python
 from mimoe_agent.config import Settings, load_settings
 from mimoe_agent.llm import MimoeChatOpenAI, make_model
-from mimoe_agent.middleware import REASONING_KEY
+from mimoe_agent.middleware import COMPUTE_REMINDER, REASONING_KEY
 from mimoe_agent.mimoe import MimoeClient, Preflight, preflight
 from mimoe_agent.stream import aiter_events, iter_events
 from mimoe_agent.tools import TOOL_NAMES, build_tools
@@ -193,6 +193,29 @@ def test_auto_approve_runs_without_interrupt(fake_mimoe: FakeMimoe, settings_tmp
     assert result["messages"][-1].content == "42"
 
 
+def test_a_question_with_a_number_reaches_the_model_with_the_compute_reminder(
+    fake_mimoe: FakeMimoe, settings_tmp: Settings
+) -> None:
+    """Request only, first model call only, before /no_think; the checkpoint keeps the question."""
+    agent, _ = _build(fake_mimoe, settings_tmp)
+    calc = {"tool_calls": [{"name": "calculator", "args": {"expression": "(10 + 20) * 11 / 2"}}]}
+    fake_mimoe.script(calc, {"content": "The sum is 165."})
+    question = "What is the sum of 10 to 20?"
+    result = agent.invoke({"messages": [HumanMessage(question)]}, CFG)
+    assert result["messages"][-1].content == "The sum is 165."
+    first, second = fake_mimoe.calls[-2:]
+    assert first["messages"][-1]["content"] == f"{question}{COMPUTE_REMINDER} /no_think"
+    assert second["messages"][-3]["content"] == f"{question} /no_think"  # answering the result
+    assert agent.get_state(CFG).values["messages"][0].content == question
+
+
+def test_run_python_mentions_approval_only_when_there_is_one(settings_tmp: Settings) -> None:
+    asked = build_tools(settings_tmp)[0].description
+    trusted = build_tools(dataclasses.replace(settings_tmp, auto_approve=True))[0].description
+    assert "create or change files" in asked and "create or change files" in trusted
+    assert "approves the code" in asked and "approves" not in trusted
+
+
 def test_chat_only_build_has_no_tools(
     fake_mimoe: FakeMimoe, settings_tmp: Settings, preflight_fake: Preflight
 ) -> None:
@@ -204,6 +227,9 @@ def test_chat_only_build_has_no_tools(
     body = fake_mimoe.calls[-1]
     assert "tools" not in body and "tool_choice" not in body
     assert "Tools are disabled" in body["messages"][0]["content"]
+    fake_mimoe.script({"content": "4"})
+    agent.invoke({"messages": [HumanMessage("What is 2 + 2?")]}, CFG)
+    assert COMPUTE_REMINDER not in fake_mimoe.calls[-1]["messages"][-1]["content"]  # no tools
 
 
 def test_model_call_limit_ends_the_turn_with_a_notice(

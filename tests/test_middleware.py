@@ -19,9 +19,11 @@ from mimoe_agent.agent import build_agent
 from mimoe_agent.config import Settings, load_settings
 from mimoe_agent.llm import make_model
 from mimoe_agent.middleware import (
+    COMPUTE_REMINDER,
     MALFORMED_TOOL_CALL,
     OLD_RESULT_TAIL,
     REASONING_KEY,
+    ComputeReminderMiddleware,
     GuardrailMiddleware,
     QwenMiddleware,
     clean_ai_message,
@@ -209,6 +211,50 @@ async def test_soft_no_think_patches_latest_human_message_in_request_only(
 
     QwenMiddleware(soft_no_think=False).wrap_model_call(request, handler)
     assert handler.seen is request  # nothing to patch: the request object passes through
+
+
+async def test_compute_reminder_follows_a_question_with_a_number_in_the_request_only(
+    llm_fake: ChatOpenAI,
+) -> None:
+    question = HumanMessage("What is the sum of 10 to 20?")
+    request = _request(llm_fake, HumanMessage("Hello"), AIMessage(content="Hi!"), question)
+    handler = Recorder(AIMessage(content="ok"))
+
+    ComputeReminderMiddleware().wrap_model_call(request, handler)
+    assert handler.seen is not None
+    assert handler.seen.messages[-1].content == "What is the sum of 10 to 20?" + COMPUTE_REMINDER
+    assert handler.seen.messages[0].content == "Hello"
+    assert question.content == "What is the sum of 10 to 20?"  # the checkpointed message
+    await ComputeReminderMiddleware().awrap_model_call(request, handler.acall)
+    assert handler.seen.messages[-1].content.endswith(COMPUTE_REMINDER)
+
+    blocks = HumanMessage(content=[{"type": "text", "text": "What is 15% of 80?"}])
+    ComputeReminderMiddleware().wrap_model_call(_request(llm_fake, blocks), handler)
+    assert handler.seen.messages[-1].content[-1] == {
+        "type": "text",
+        "text": COMPUTE_REMINDER.strip(),
+    }
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [HumanMessage("Summarize notes.md")],  # no number
+        [  # after a tool result: the model is answering from it now
+            HumanMessage("What is the sum of 10 to 20?"),
+            AIMessage(content="", tool_calls=[TOOL_CALL]),
+            ToolMessage(content="165", tool_call_id="tool_0", name="calculator"),
+        ],
+        [HumanMessage("What is 2 + 2?" + COMPUTE_REMINDER)],  # already there
+    ],
+)
+def test_compute_reminder_leaves_other_requests_alone(
+    llm_fake: ChatOpenAI, messages: list[Any]
+) -> None:
+    request = _request(llm_fake, *messages)
+    handler = Recorder(AIMessage(content="ok"))
+    ComputeReminderMiddleware().wrap_model_call(request, handler)
+    assert handler.seen is request
 
 
 def test_invalid_tool_call_guard_keeps_the_next_request_clean(llm_fake: ChatOpenAI) -> None:

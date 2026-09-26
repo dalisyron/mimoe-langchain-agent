@@ -184,6 +184,71 @@ class QwenMiddleware(AgentMiddleware):
         return self.clean(await handler(self.prepare(request)))
 
 
+COMPUTE_REMINDER = " (Use calculator or run_python for any arithmetic.)"
+"""Added after a question that contains a digit, in the request only (see
+:class:`ComputeReminderMiddleware`)."""
+
+
+def _text(message: HumanMessage) -> str:
+    """The text of a human message, whether its content is a string or a list of blocks."""
+    if isinstance(message.content, str):
+        return message.content
+    return " ".join(
+        str(block.get("text", "")) if isinstance(block, dict) else str(block)
+        for block in message.content
+    )
+
+
+class ComputeReminderMiddleware(AgentMiddleware):
+    """Remind the model, next to a question that contains a number, to compute with a tool.
+
+    The system prompt's arithmetic rule moved larger calculations to calculator or run_python,
+    but qwen3-4b-instruct-2507 still answered small ones from memory: "What is the sum of 10 to
+    20?" came out as 155 (it is 165), none of 7 small-arithmetic questions went to a tool, and two
+    rewordings of the rule moved at most one. With :data:`COMPUTE_REMINDER` after the question, 5 of
+    7 went to a tool (the other two were answered correctly), the larger calculations stayed on
+    tools, questions that merely contain numbers ("Who won the 2018 World Cup?") got no tool, and
+    no workspace question changed tool or arguments (first-step replays at temperature 0). A
+    longer reminder that began "If this needs any calculation" moved only 2 of 7.
+
+    Request side only, on the first model call of a turn (the request ends with the user's
+    message); the checkpoint never sees it. ``build_agent`` lists it before
+    :class:`QwenMiddleware`, so the reminder lands before the ``/no_think`` that one appends.
+    """
+
+    def prepare(self, request: ModelRequest) -> ModelRequest:
+        """Return the request with the reminder after a question that contains a digit."""
+        messages: list[AnyMessage] = list(request.messages)
+        if not messages or not isinstance(messages[-1], HumanMessage):
+            return request
+        question = messages[-1]
+        text = _text(question)
+        if not any(char.isdigit() for char in text) or COMPUTE_REMINDER.strip() in text:
+            return request
+        if isinstance(question.content, str):
+            content: Any = question.content.rstrip() + COMPUTE_REMINDER
+        else:
+            content = [*question.content, {"type": "text", "text": COMPUTE_REMINDER.strip()}]
+        messages[-1] = question.model_copy(update={"content": content})
+        return request.override(messages=messages)
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        """Sync hook: add the reminder, call the model."""
+        return handler(self.prepare(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        """Async hook: same as :meth:`wrap_model_call`."""
+        return await handler(self.prepare(request))
+
+
 class GuardrailMiddleware(AgentMiddleware[ModelCallLimitState[Any], Any, Any]):
     """Budget and size guard rails around tool calls and the model request.
 

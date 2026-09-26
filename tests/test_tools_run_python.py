@@ -643,6 +643,16 @@ def test_tool_metadata_and_invoke(ws: FakeWorkspace) -> None:
     assert tool.invoke({"code": "print(1)"}) == "exit_code: 0\nstdout:\n1\nstderr: (empty)"
 
 
+def test_description_says_it_writes_files_and_who_approves(ws: FakeWorkspace) -> None:
+    """Without it the model refused to create a file: every other tool only reads."""
+    asked = make_run_python(ws, allow_network=False).description
+    trusted = make_run_python(ws, allow_network=False, approval=False).description
+    for description in (asked, trusted):
+        assert "It is also how you create or change files in the workspace" in description
+    assert asked.endswith("the user sees and approves the code before it runs.")
+    assert "approves" not in trusted  # --auto-approve: nobody does
+
+
 def test_tool_never_raises(ws: FakeWorkspace, monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(*args: object, **kwargs: object) -> RunResult:
         raise OSError("no interpreter")

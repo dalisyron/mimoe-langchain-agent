@@ -23,8 +23,9 @@ components connect. Those are the sections [Approach](#approach),
 You ask questions about a folder ("what files are here", "sum the revenue column", "where are the
 TODOs") and a local model answers them by calling tools: list, read and search files, run Python,
 a calculator, the clock, read-only git, and a status tool that reports on the engine itself. The
-only tool that can change anything, `run_python`, stops the run and asks you to approve or deny the
-code, in the terminal and in the browser, before anything executes. Everything is on-device: the
+only tool that can change anything, `run_python` (also how the agent creates or edits files), stops
+the run and asks you to approve or deny the code, in the terminal and in the browser, before anything
+executes. Everything is on-device: the
 model runs in mimOE Studio (the agent never picks a cloud or provider model that Studio may also
 list), the agent's own tools never open a network connection, and the web server only listens on
 `127.0.0.1`.
@@ -199,7 +200,7 @@ Two lines of LangGraph vocabulary, since `create_agent` compiles to a LangGraph 
 | React + Vite + TypeScript with the built bundle committed in `web/dist` | The reviewer needs no Node.js; the UI is about 750 lines with no UI kit, and the reducer, SSE parser and stream consumer have vitest tests. | Streamlit or Gradio: fast to start, but the per-turn tool cards, the approval panel with one decision per request, Stop and resume did not fit their request/rerun model. |
 | uv | One command installs Python 3.13 and the locked dependencies on macOS, Windows and Linux; `uv run mimoe-agent` is the whole quickstart. | pip or poetry: pip needs a Python 3.13 and a venv first; poetry is one more tool to install. |
 | Plain `@tool` functions, with pandas available to `run_python` | Eight ordinary functions whose docstrings are the descriptions the model reads; pandas because the model reaches for it every time and gets CSVs right (my csv-module fallback miscounted the header row). | RAG, a vector store or SQLite: the workspace is small, `read_file`/`search_files`/`run_python` answer everything, and an index is more setup, more dependencies and one more thing that can be stale. |
-| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 711 tests run on CI without Studio; six live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
+| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 718 tests run on CI without Studio; eight live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
 | Python 3.13 as the floor | The workspace jail uses `ntpath.isreserved` (new in 3.13) and `Path.is_junction` (3.12) for Windows; uv installs 3.13 anyway. | Supporting 3.10 to 3.12 with fallbacks: more code paths to test on Windows for no benefit to the reviewer. |
 
 ## How the components connect
@@ -213,7 +214,7 @@ flowchart TB
     API["server.py: FastAPI on 127.0.0.1:8000"]
     ST["stream.py: graph output to events"]
     subgraph AGENT["agent.py: create_agent graph"]
-        MW["middleware: Qwen cleanup, guardrails, 8-call limit, approval on run_python"]
+        MW["middleware: compute reminder, Qwen cleanup, guardrails, 8-call limit, approval on run_python"]
         CK[("InMemorySaver: one checkpoint per thread")]
     end
     TOOLS["tools/: 8 tools"]
@@ -246,8 +247,11 @@ What each module does, in reading order:
   registered models, loads and unloads on both API shapes, runs the warm-up `ping` probe, and turns
   every failure into a message plus a Studio click path (`friendly_error`).
 - `llm.py`: the `ChatOpenAI` factory pinned for mimOE (see the choices table).
-- `agent.py`: the system prompt and `build_agent`, which is one `create_agent(...)` call with four
-  middleware in this order: `QwenMiddleware` (moves inline `<think>` text out of the answer, appends
+- `agent.py`: the system prompt and `build_agent`, which is one `create_agent(...)` call with five
+  middleware in this order: `ComputeReminderMiddleware` (adds "(Use calculator or run_python for any
+  arithmetic.)" after a question that contains a number, in the request only; a small model answered
+  small sums from memory despite the system prompt's rule), `QwenMiddleware` (moves inline `<think>`
+  text out of the answer, appends
   `/no_think` on 0.6 engines, neutralises a malformed tool call), `GuardrailMiddleware` (caps every
   tool result at 8 KB, turns a tool exception into an error message the model can read, marks a
   result that reports a failure, such as `ERROR: ...` or a snippet that exited non-zero, as failed
@@ -555,8 +559,8 @@ hint is on stderr), 130 for Ctrl-C at the prompt. Piped input works
 
 ```bash
 uv sync                                   # dependencies plus the dev group
-uv run pytest -q                          # 711 offline tests against the fake engine, no Studio needed
-MIMOE_LIVE=1 uv run pytest -m live        # 6 live tests against a running Studio (a handful of completions)
+uv run pytest -q                          # 718 offline tests against the fake engine, no Studio needed
+MIMOE_LIVE=1 uv run pytest -m live        # 8 live tests against a running Studio (a handful of completions)
 uvx ruff check . && uvx ruff format --check .
 cd web && npm ci && npm test && npm run build   # 35 vitest tests; the build writes web/dist
 ```
@@ -608,6 +612,8 @@ Things the assistant got wrong that tests or reviews caught:
 | A calculator error that named the refused syntax (`unsupported syntax: GeneratorExp`) but not the tool to use instead, on a call the web UI showed as done because only exceptions counted as failures. Asked how many primes lie between 1000 and 4500, qwen3-4b-instruct-2507 sent the same expression again and then answered 543 "after checking known prime distribution data" (there are 442) | My own session in the web UI, then replayed from the engine log with the exact messages: with the old error the model resent the call in 3 of 3 runs, with an error that names `run_python` it switched to `run_python` in 3 of 3. The calculator's description now says what it cannot run, its errors point to `run_python`, a result that reports a failure shows as failed in both interfaces, and a live test replays the step |
 | A system-prompt rule, "Only state numbers that appear in a tool result", that qwen3-4b-instruct-2507 did not take as a reason to call a tool. Asked for the sum of the multiples of 5 between 432 and 43229, it worked the series out in text and answered 186,000,000 (the sum is 186,842,970) | My own session, then first-step replays of about twenty questions under five prompt wordings: with the old rule the model did 6 of 8 number questions in its head, four of them wrong. The rule now says never to do arithmetic in your head and names `calculator` and `run_python`: 7 of 8 go to a tool, questions about facts and the workspace get the same tools as before, and a live test replays the question. A longer rule that listed sums, averages and percentages did worse (4 of 10) |
 | The arithmetic rule above was checked on which tool the model picked, not on its arguments. With it, "Show me the list of files in my workspace" made qwen3-4b-instruct-2507 pass the workspace's absolute path from the system prompt, which the file tools refused, so the listing took a second call | My own session. A replay of six "my workspace" questions showed the switch (the old prompt sent `.`, and `/` for one wording). The jail now takes an absolute path inside the workspace as the relative path it names, and a live test asks the question on the sample workspace and runs the call the model makes |
+| The arithmetic rule did not reach small sums. In a later session the model answered "What is the sum of 10 to 20?" with 155 (it is 165); I had reported the small sums it answered itself as correct | My own session, then a replay of 36 questions: none of 7 small-arithmetic questions went to a tool, two rewordings of the rule moved at most one, and the engine ignores `tool_choice`, so a tool call cannot be forced. A reminder after every question that contains a number, "(Use calculator or run_python for any arithmetic.)", sent in the request only, moved 5 of 7 to a tool; questions that merely mention a number ("Who won the 2018 World Cup?") get no tool, and the workspace tools and their arguments are unchanged. A live test asks the question through the real agent |
+| Nothing told the model that `run_python` can write files, so asked to create a reminders file it answered "I can't create or modify files directly in the workspace as per your instructions" | My own session. One sentence in `run_python`'s description ("It is also how you create or change files in the workspace: the user sees and approves the code before it runs", without the approval part under `--auto-approve`): 3 of 5 file requests now start with the write and the other two look first (read the file, list the folder); a live test checks that the request ends at the approval with the code that writes the file |
 
 Every design decision described above was mine to approve: the assistant proposed, I chose, and
 a diff I could not explain did not go in.
@@ -629,9 +635,11 @@ a diff I could not explain did not go in.
   prompt sometimes searches `*.md` only. The model also declines code it expects to run long or
   use a lot of memory, because the tool description tells it about the 30 s and 2 GB limits, and
   now and then it sends code with literal `\n` escapes instead of line breaks; the tool answers
-  that with a specific error so the model resends it properly. Small arithmetic, such as the
-  average of five numbers or a bill split three ways, is still sometimes answered without a tool
-  (correctly, in my runs); larger and multi-step calculations go to `calculator` or `run_python`.
+  that with a specific error so the model resends it properly. With the reminder after questions
+  that contain a number, 5 of 7 small sums in my replay went to a tool; the two answered from
+  memory were right, but a 4B model can still get arithmetic wrong that way, so trust numbers that
+  came from a tool. When it writes a file, it sometimes keeps a relative date ("two days from now")
+  or overwrites an existing file; the approval shows the code before anything runs.
 - Cancelling a turn closes the model stream, but Studio 0.6.5 has no cancel and keeps generating
   the abandoned answer for a moment, so the next prompt can wait a few seconds.
 - Single-user loopback server: no authentication, per-thread locks kept for the process lifetime,

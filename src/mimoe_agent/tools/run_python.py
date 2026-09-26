@@ -356,6 +356,7 @@ def make_run_python(
     ws: Workspace,
     *,
     allow_network: bool,
+    approval: bool = True,
     timeout_s: float = 30.0,
     memory_limit_mb: int = MEMORY_LIMIT_MB,
 ) -> BaseTool:
@@ -364,6 +365,8 @@ def make_run_python(
     Args:
         ws: Workspace whose root is the child's working directory.
         allow_network: Whether the child's socket guard is lifted (``--allow-network``).
+        approval: Whether the user approves each run (not ``--auto-approve``); the description
+            says so only when it is true.
         timeout_s: Wall-clock limit per run.
         memory_limit_mb: Resident-memory limit per run (child and grandchildren).
 
@@ -372,12 +375,17 @@ def make_run_python(
         cancel ``threading.Event`` from ``config["configurable"][CANCEL_KEY]`` when present.
     """
     network = "allowed" if allow_network else "disabled"
+    # Without this sentence the model refused to create a file ("I can't create or modify files
+    # directly in the workspace as per your instructions"): every other tool reads.
+    files = "It is also how you create or change files in the workspace" + (
+        ": the user sees and approves the code before it runs." if approval else "."
+    )
     description = (
         "Run a Python snippet with the workspace as the current directory and return what it "
         "prints; a trailing bare expression is echoed like in a notebook. Print the values you "
         "need; pandas and the standard library are available, output is capped at 8 KB, the run "
         f"is killed after {timeout_s:g} s or above {memory_limit_mb // 1024:g} GB of memory, and "
-        f"network access is {network}."
+        f"network access is {network}. {files}"
     )
 
     def run_python(code: str, config: RunnableConfig) -> str:

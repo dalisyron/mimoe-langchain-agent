@@ -129,7 +129,10 @@ and strip it from `content`; if `invalid_tool_calls` and no `tool_calls`, replac
 and set `status="error"` on a returned result that `reports_failure` (it starts with `ERROR:`, or its
 first line is `exit_code:` with a non-zero code or a `(killed:` note); the content is unchanged;
 model hooks shorten ToolMessages older than the current turn to `old_result_cap` chars in the
-request only.
+request only. ComputeReminderMiddleware (wrap_model_call + awrap_model_call): when the request ends
+with a HumanMessage whose text contains a digit, append `COMPUTE_REMINDER` (" (Use calculator or
+run_python for any arithmetic.)") to it in the request only; it runs outside QwenMiddleware, so the
+reminder comes before " /no_think".
 
 ## agent.py
 ```python
@@ -137,7 +140,7 @@ SYSTEM_PROMPT: str
 def system_prompt(settings: Settings, pre: Preflight) -> str
 def build_agent(settings: Settings, pre: Preflight, *, llm: BaseChatModel | None = None, tools: Sequence[BaseTool] | None = None, checkpointer: BaseCheckpointSaver | None = None)
 ```
-Middleware order: `[QwenMiddleware(soft_no_think=pre.thinking_control == "soft" and not settings.think), GuardrailMiddleware(), ModelCallLimitMiddleware(thread_limit=8, exit_behavior="end"), HumanInTheLoopMiddleware(interrupt_on={"run_python": InterruptOnConfig(allowed_decisions=["approve", "reject"], description=...)})]`;
+Middleware order: `[ComputeReminderMiddleware() (only when the tools include calculator and run_python), QwenMiddleware(soft_no_think=pre.thinking_control == "soft" and not settings.think), GuardrailMiddleware(), ModelCallLimitMiddleware(thread_limit=8, exit_behavior="end"), HumanInTheLoopMiddleware(interrupt_on={"run_python": InterruptOnConfig(allowed_decisions=["approve", "reject"], description=...)})]`;
 the HITL entry is omitted when `settings.auto_approve`. `tools=[]` when not `pre.tools_enabled`.
 Checkpointer default `InMemorySaver()`.
 
@@ -162,7 +165,7 @@ def build_tools(settings: Settings, client: MimoeClient | None = None) -> list[B
 class Workspace:  __init__(root: Path); resolve(rel: str) -> Path  (an absolute path under the root counts as the relative path it names; raises WorkspaceError on escape)
 def make_workspace_tools(ws: Workspace) -> list[BaseTool]     # list_files, read_file, search_files
 # run_python.py
-def make_run_python(ws: Workspace, *, allow_network: bool, timeout_s: float = 30.0, memory_limit_mb: int = MEMORY_LIMIT_MB) -> BaseTool
+def make_run_python(ws: Workspace, *, allow_network: bool, approval: bool = True, timeout_s: float = 30.0, memory_limit_mb: int = MEMORY_LIMIT_MB) -> BaseTool   # build_tools passes approval=not settings.auto_approve
 @dataclass class RunResult: stdout: str; stderr: str; exit_code: int | None; timed_out: bool; killed_for_size: bool; killed_for_memory: bool = False; cancelled: bool = False
 def run_python_code(code: str, ws: Workspace, *, allow_network: bool, timeout_s: float, memory_limit_mb: int = MEMORY_LIMIT_MB, cancel: threading.Event | None = None) -> RunResult
 CANCEL_KEY = "mimoe_cancel"   # config["configurable"][CANCEL_KEY]: a threading.Event per turn; set by Ctrl-C (CLI) or Stop/disconnect (server), it kills the snippet's tree

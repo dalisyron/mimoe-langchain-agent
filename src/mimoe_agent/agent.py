@@ -116,8 +116,10 @@ def build_agent(
             ``InMemorySaver``.
 
     Returns:
-        The compiled agent graph. Middleware, outermost first: ``QwenMiddleware`` (think handling,
-        ``/no_think``), ``GuardrailMiddleware`` (result caps, tool errors, per-turn budget reset),
+        The compiled agent graph. Middleware, outermost first: ``ComputeReminderMiddleware`` (tool
+        mode only: "use calculator or run_python" after a question with a number in it),
+        ``QwenMiddleware`` (think handling, ``/no_think``), ``GuardrailMiddleware`` (result caps,
+        tool errors, per-turn budget reset),
         ``ModelCallLimitMiddleware(thread_limit=8, exit_behavior="end")`` and, unless
         ``settings.auto_approve``, ``HumanInTheLoopMiddleware`` on ``run_python`` with the decisions
         ``approve``/``reject``.
@@ -131,7 +133,11 @@ def build_agent(
     from langgraph.checkpoint.memory import InMemorySaver
 
     from mimoe_agent.llm import make_model
-    from mimoe_agent.middleware import GuardrailMiddleware, QwenMiddleware
+    from mimoe_agent.middleware import (
+        ComputeReminderMiddleware,
+        GuardrailMiddleware,
+        QwenMiddleware,
+    )
     from mimoe_agent.tools import build_tools
 
     model = llm if llm is not None else make_model(settings, pre)
@@ -144,7 +150,10 @@ def build_agent(
         agent_tools = build_tools(settings)
 
     guard = GuardrailMiddleware()
-    middleware: list[Any] = [
+    # the reminder names these tools, so an agent without them (chat-only mode) goes without it
+    computes = {"calculator", "run_python"} <= {tool.name for tool in agent_tools}
+    middleware: list[Any] = [ComputeReminderMiddleware()] if computes else []
+    middleware += [
         QwenMiddleware(soft_no_think=pre.thinking_control == "soft" and not settings.think),
         guard,
         ModelCallLimitMiddleware(thread_limit=guard.thread_limit, exit_behavior="end"),

@@ -44,7 +44,9 @@ def build_tools(settings: Settings, client: MimoeClient | None = None) -> list[B
 
     ws = Workspace(settings.workspace)
     tools: list[BaseTool] = [
-        make_run_python(ws, allow_network=settings.allow_network),
+        make_run_python(
+            ws, allow_network=settings.allow_network, approval=not settings.auto_approve
+        ),
         *make_workspace_tools(ws),
         calculator,
         now,
