@@ -152,6 +152,17 @@ def test_system_prompt_variants(settings_tmp: Settings, preflight_fake: Prefligh
     assert "run Python" not in chat_only
 
 
+def test_system_prompt_sends_arithmetic_to_the_tools(
+    settings_tmp: Settings, preflight_fake: Preflight
+) -> None:
+    """The rule that made qwen3-4b-instruct-2507 compute numbers with a tool instead of in text
+    (see the SYSTEM_PROMPT docstring); the live suite replays the question that prompted it."""
+    prompt = " ".join(system_prompt(settings_tmp, preflight_fake).split())
+    assert "Never do arithmetic in your head, not even one multiplication" in prompt
+    assert "from calculator (one expression) or run_python (ranges, counting" in prompt
+    assert "fix the call and retry instead of guessing" in prompt
+
+
 def test_default_http_clients_ignore_proxy_env(
     settings_tmp: Settings, preflight_fake: Preflight, monkeypatch: pytest.MonkeyPatch
 ) -> None:

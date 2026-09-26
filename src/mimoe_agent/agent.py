@@ -30,12 +30,21 @@ SYSTEM_PROMPT = (
     "Call a tool only when it is needed to answer; for greetings or general questions answer "
     "directly. Never invent file contents or results.\n"
     "The workspace folder is {workspace}; tool paths are relative to it.\n"
-    "Answer in at most five sentences unless asked for detail. Only state numbers that appear in "
-    "a tool result; if a tool returns an error or empty output, fix the call and retry instead of "
-    "guessing."
+    "Answer in at most five sentences unless asked for detail. Never do arithmetic in your head, "
+    "not even one multiplication: get every computed number from calculator (one expression) or "
+    "run_python (ranges, counting, sums over many values) and state the result it returns. If a "
+    "tool returns an error or empty output, fix the call and retry instead of guessing."
 )
 """Tool-mode prompt. The first three sentences are the wording that scored 6/6 on tool selection
-with qwen3-4b; ``{workspace}`` is filled in by :func:`system_prompt`."""
+with qwen3-4b; ``{workspace}`` is filled in by :func:`system_prompt`.
+
+The arithmetic rule replaced "Only state numbers that appear in a tool result", which
+qwen3-4b-instruct-2507 did not take as a reason to call a tool: it worked 6 of 8 number questions
+out in text, four of them wrong (a sum of multiples of 5 came out as 186,000,000 instead of
+186,842,970). With the rule, 7 of 8 went to calculator or run_python, questions about facts that
+contain numbers still got no tool, and the workspace questions picked the same tools as before
+(first-step replays at temperature 0). A longer rule that listed sums, averages and percentages
+did worse (4 of 10)."""
 
 SYSTEM_PROMPT_CHAT_ONLY = (
     "You are a private local assistant for a developer's workspace folder at {workspace}. "

@@ -1,9 +1,9 @@
 """Live smoke tests against a running mimOE Studio.
 
 Skipped unless ``MIMOE_LIVE=1`` (and selected with ``-m live``, which ``addopts`` excludes by
-default). Budget: at most five completions in total: one REPL session with one prompt (probe +
-tool call + answer) and one replayed step (probe + one completion); the preflight test skips the
-probe with ``force_tools``.
+default). Budget: at most seven completions in total: one REPL session with one prompt (probe +
+tool call + answer) and two replayed steps (probe + one completion each); the preflight test
+skips the probe with ``force_tools``.
 
 ``MIMOE_BASE_URL`` / ``MIMOE_API_KEY`` are read at import time because the autouse
 ``_clean_mimoe_env`` fixture strips every ``MIMOE_*`` variable before a test runs.
@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -89,6 +90,38 @@ PREAMBLE = (
     "I'll calculate the number of prime numbers between 1000 and 4500 inclusive. This requires a "
     "mathematical computation rather than file inspection or git operations.\n\n\n"
 )
+MULTIPLES = "What is the sum of every multiplier of 5 between 432 and 43229?"
+
+
+def _next_step(workspace_tmp: Path, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """The model's reply to ``messages`` after the agent's system prompt, with the agent's tools
+    and temperature (probe + one completion)."""
+    settings = load_settings(
+        {"workspace": workspace_tmp, "base_url": BASE_URL, "api_key": API_KEY},
+        cwd=workspace_tmp.parent,
+    )
+    client = MimoeClient(settings.base_url, settings.api_key)
+    try:
+        pre = preflight(settings, client=client)
+        reply = client.chat(
+            {
+                "model": pre.model.id,
+                "messages": [
+                    {"role": "system", "content": system_prompt(settings, pre)},
+                    *messages,
+                ],
+                "tools": [convert_to_openai_tool(t) for t in build_tools(settings, client)],
+                "temperature": 0,
+                "max_tokens": 400,
+            }
+        )
+    finally:
+        client.close()
+    return reply["choices"][0]["message"]
+
+
+def _tool_names(message: dict[str, Any]) -> list[str]:
+    return [call["function"]["name"] for call in message.get("tool_calls") or []]
 
 
 def test_the_real_model_moves_from_a_refused_calculator_call_to_run_python(
@@ -97,16 +130,10 @@ def test_the_real_model_moves_from_a_refused_calculator_call_to_run_python(
     """Replays a real web-session step: after the calculator refused a generator expression,
     qwen3-4b-instruct-2507 resent it (3 of 3 runs with the old "unsupported syntax" text) and
     then guessed a number. With the error that names run_python, its next step is run_python."""
-    settings = load_settings(
-        {"workspace": workspace_tmp, "base_url": BASE_URL, "api_key": API_KEY},
-        cwd=workspace_tmp.parent,
-    )
-    client = MimoeClient(settings.base_url, settings.api_key)
-    try:
-        pre = preflight(settings, client=client)
-        call = {"name": "calculator", "arguments": json.dumps({"expression": PRIMES})}
-        messages = [
-            {"role": "system", "content": system_prompt(settings, pre)},
+    call = {"name": "calculator", "arguments": json.dumps({"expression": PRIMES})}
+    message = _next_step(
+        workspace_tmp,
+        [
             {
                 "role": "user",
                 "content": "How many prime numbers are there between 1000 and 4500 "
@@ -123,18 +150,15 @@ def test_the_real_model_moves_from_a_refused_calculator_call_to_run_python(
                 "name": "calculator",
                 "content": calculate(PRIMES),
             },
-        ]
-        reply = client.chat(
-            {
-                "model": pre.model.id,
-                "messages": messages,
-                "tools": [convert_to_openai_tool(t) for t in build_tools(settings, client)],
-                "temperature": 0,
-                "max_tokens": 400,
-            }
-        )
-    finally:
-        client.close()
-    message = reply["choices"][0]["message"]
-    names = [c["function"]["name"] for c in message.get("tool_calls") or []]
-    assert names == ["run_python"], message
+        ],
+    )
+    assert _tool_names(message) == ["run_python"], message
+
+
+def test_the_real_model_computes_numbers_with_a_tool(workspace_tmp: Path) -> None:
+    """A real web-session question: qwen3-4b-instruct-2507 worked the series out in text and
+    answered 186,000,000 (the sum is 186,842,970). With the system prompt's arithmetic rule its
+    first step is a tool call."""
+    message = _next_step(workspace_tmp, [{"role": "user", "content": f"{MULTIPLES} /no_think"}])
+    names = _tool_names(message)
+    assert names and set(names) <= {"calculator", "run_python"}, message
