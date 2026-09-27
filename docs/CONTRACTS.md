@@ -27,8 +27,10 @@ class Settings:
     force_tools: bool         # default False (skip the tool probe result)
     trace: bool               # default False (LangSmith env vars forced off unless True)
     sources: Mapping[str, str]  # field name -> "flag" | "env" | ".env" | "default"
+    history: str | None = None  # serve's conversation file: a path, "off" (memory), None = per-user default; flag/env only, never .env
 
 def load_settings(overrides: Mapping[str, object] | None = None, *, cwd: Path | None = None) -> Settings
+def history_path(settings: Settings) -> Path | None   # None = keep conversations in memory
 ```
 Precedence: overrides (CLI flags, only keys whose value is not None) > process env
 (`MIMOE_BASE_URL`, `MIMOE_API_KEY`, `MIMOE_MODEL`, `MIMOE_WORKSPACE`, `MIMOE_THINK`,
@@ -199,6 +201,16 @@ approval is pending. `POST /api/resume {thread_id, interrupt_id, decisions:["app
 -> SSE; 409 stale/nothing pending; 422 bad decisions. `GET /api/health` ->
 `{mimoe_reachable, model, tokens_per_second, max_context, node, engine_version, generation, workspace, approval, network, mode:"tools"|"chat_only", error}`.
 `GET /api/models` -> `{loaded:[...], registry:[...], current}`. `POST /api/model {model, unload_previous}` -> `{model, probe}`.
+`GET /api/threads` -> `{threads:[{id, title, created_at, updated_at}]}` (most recently used first;
+ISO 8601 UTC). `GET /api/threads/{id}` -> `{id, title, created_at, updated_at, turns, approval, busy}`:
+`turns` are `{role:"user", text}` and `{role:"assistant", blocks:[...], stats?:{model, usage}}` with
+blocks `{kind:"thinking"|"text"|"notice", text}` and `{kind:"tool", id, name, args, status, result?}`
+(`status`: done, error, denied, awaiting_approval, running; tool ids aliased per turn as the stream
+does), `approval` is `{interrupt_id, action_requests}` while one is pending, else null; 404 unknown.
+`PATCH /api/threads/{id} {title}` -> the summary (422 empty, 404 unknown). `DELETE /api/threads/{id}`
+-> 204 (checkpoints and title; 409 while a run holds the thread, 404 unknown). `create_app(...,
+history: Path | None = None)`: one SQLite file for `AsyncSqliteSaver` and the `conversations` table
+(0600 in a 0700 folder on POSIX), memory when None; `serve` passes `history_path(settings)`.
 `GET /` serves `web/dist` (StaticFiles, html=True) mounted after the API routes.
 `TrustedHostMiddleware(allowed_hosts=["127.0.0.1", "localhost", "[::1]"])`; uvicorn binds 127.0.0.1.
 SSE frames: `event: <name>\ndata: <json>\n\n`; keep-alive comment every 15 s.

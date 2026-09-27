@@ -750,6 +750,20 @@ def test_serve_delegates_to_server_run(
     assert os.environ.get("LANGSMITH_TRACING") == "false"
 
 
+def test_serve_history_option(run: Run, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimoe_agent import server
+
+    recorded: dict[str, Any] = {}
+    monkeypatch.setattr(server, "run", lambda settings, port: recorded.update(settings=settings))
+    assert run("serve", "--history", "off").exit_code == 0
+    assert recorded["settings"].history == "off"
+    assert run("serve", "--history", str(tmp_path / "c.db")).exit_code == 0
+    assert recorded["settings"].history == str(tmp_path / "c.db")
+    assert run("serve").exit_code == 0
+    assert recorded["settings"].history is None  # serve then uses the per-user file
+    assert "--history" in _plain(run("serve", "--help").output)
+
+
 def test_serve_config_error_exits_1(run: Run, tmp_path: Path) -> None:
     result = run("--workspace", str(tmp_path / "missing"), "serve")
     assert result.exit_code == 1 and "pass --workspace PATH" in result.output

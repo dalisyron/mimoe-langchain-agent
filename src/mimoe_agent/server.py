@@ -24,6 +24,11 @@ shared pieces together and owns only what is server-specific:
   web UI keys its tool cards by id within one assistant turn, so the runs of a turn (the chat
   and the resumes that answer its approvals) share one :class:`mimoe_agent.stream.ToolCallIds`:
   a repeated id becomes ``tool_0#2`` and its result, arriving in the next run, follows it.
+* **History.** Conversations live in one SQLite file (``history``; memory when ``None``):
+  LangGraph's ``AsyncSqliteSaver`` holds the checkpoints and
+  :class:`mimoe_agent.history.ConversationStore` the sidebar's titles and times. Both open on
+  first use. A reopened conversation is rebuilt from its checkpoint
+  (:func:`mimoe_agent.history.transcript`), a pending approval included, also after a restart.
 * **Loopback only.** ``TrustedHostMiddleware`` accepts ``127.0.0.1``, ``localhost`` and
   ``[::1]`` (a DNS-rebinding page cannot drive the agent), uvicorn binds ``127.0.0.1`` and
   there is no CORS middleware: the Vite dev proxy keeps ``/api`` same-origin.
@@ -48,7 +53,8 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -57,7 +63,8 @@ from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import Receive, Scope, Send
 
-from mimoe_agent.config import Settings
+from mimoe_agent.config import Settings, history_path
+from mimoe_agent.history import ConversationStore, title_from, transcript
 from mimoe_agent.mimoe import (
     HINT_NO_MODEL,
     MimoeClient,
@@ -112,7 +119,11 @@ HINT_SWITCH_IN_PROGRESS = "A model switch is in progress; wait for POST /api/mod
 HINT_SWITCH_BUSY = "Wait for the running conversation turn(s) to finish, then switch again."
 HINT_MODEL_ID = "Model ids use letters, digits, '.', '_' and '-'; GET /api/models lists them."
 HINT_REQUEST_BODY = "Send a JSON body with the fields the endpoint expects (see docs/CONTRACTS.md)."
-HINT_NOT_FOUND = "The API offers /api/chat, /api/resume, /api/health, /api/models and /api/model."
+HINT_NOT_FOUND = (
+    "The API offers /api/chat, /api/resume, /api/threads, /api/health, /api/models and /api/model."
+)
+HINT_NO_THREAD = "GET /api/threads lists the conversations."
+HINT_TITLE = "Send a non-empty title of at most 200 characters."
 STATUS_STARTING = "connecting to mimOE Studio, please wait"
 STATUS_SWITCHING = "a model switch is in progress, please wait"
 
@@ -137,6 +148,12 @@ class ResumeBody(BaseModel):
     thread_id: str = Field(min_length=1, max_length=MAX_THREAD_ID_LENGTH)
     interrupt_id: str = Field(min_length=1)
     decisions: list[str]
+
+
+class RenameBody(BaseModel):
+    """``PATCH /api/threads/{thread_id}``."""
+
+    title: str = Field(max_length=200)
 
 
 class ModelBody(BaseModel):
@@ -334,10 +351,17 @@ class AgentRuntime:
     """
 
     def __init__(
-        self, settings: Settings, client: MimoeClient, model_factory: ModelFactory
+        self,
+        settings: Settings,
+        client: MimoeClient,
+        model_factory: ModelFactory,
+        history: Path | None = None,
     ) -> None:
         self.settings = settings
         self.client = client
+        self.history = history
+        """The SQLite file for checkpoints and titles; ``None`` keeps them in memory."""
+        self.conversations = ConversationStore(history)
         self._model_factory = model_factory
         self.model_id: str | None = settings.model
         """The model the agent should use; ``None`` lets the preflight pick the first loaded."""
@@ -346,6 +370,7 @@ class AgentRuntime:
         """``(message, hint)`` of the last failed preflight, for ``/api/health``."""
         self.switching = False
         self._checkpointer: BaseCheckpointSaver | None = None
+        self._checkpointer_lock = asyncio.Lock()
         self._locks: dict[str, asyncio.Lock] = {}
         self._tool_ids: dict[str, ToolCallIds] = {}
         """Thread id -> the tool-call id aliases of its current turn (module docstring)."""
@@ -375,6 +400,18 @@ class AgentRuntime:
             self._tool_ids[thread_id] = ToolCallIds()
         return self._tool_ids[thread_id]
 
+    def adopt_tool_ids(self, thread_id: str, ids: ToolCallIds) -> None:
+        """Continue a restored turn's tool-call aliases on its resume (after a restart the
+        runtime has none; within one process it already has the same ones)."""
+        self._tool_ids.setdefault(thread_id, ids)
+
+    def forget(self, thread_id: str) -> None:
+        """Drop a deleted thread's aliases and its (released) lock."""
+        self._tool_ids.pop(thread_id, None)
+        lock = self._locks.get(thread_id)
+        if lock is not None and not lock.locked():
+            del self._locks[thread_id]
+
     async def begin(self, thread_id: str) -> _Turn:
         """Take the thread's lock for one run.
 
@@ -393,6 +430,53 @@ class AgentRuntime:
         """The run config: the thread plus the model name for ``done`` on notice-only turns."""
         return {"configurable": {"thread_id": thread_id}, "metadata": {"model": pre.model.id}}
 
+    async def checkpointer(self) -> BaseCheckpointSaver:
+        """The checkpointer every build shares (threads survive a model switch), opened once:
+        SQLite when :attr:`history` is set, memory otherwise."""
+        if self._checkpointer is not None:
+            return self._checkpointer
+        async with self._checkpointer_lock:
+            if self._checkpointer is None:
+                if self.history is None:
+                    from langgraph.checkpoint.memory import InMemorySaver
+
+                    self._checkpointer = InMemorySaver()
+                else:
+                    import aiosqlite
+                    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+                    from mimoe_agent.history import prepare_history_file
+
+                    prepare_history_file(self.history)
+                    saver = AsyncSqliteSaver(aiosqlite.connect(self.history))
+                    await saver.setup()
+                    self._checkpointer = saver
+        return self._checkpointer
+
+    async def close(self) -> None:
+        """Close the history's connections (the server is shutting down)."""
+        await self.conversations.close()
+        conn = getattr(self._checkpointer, "conn", None)
+        if conn is not None:
+            await conn.close()
+
+    async def thread_state(self, thread_id: str) -> tuple[list[Any], Interrupt | None]:
+        """A thread's checkpointed messages and the interrupt it waits on.
+
+        Through the agent when it is built; otherwise straight from the checkpointer, so the
+        history stays readable while the engine is down (a pending approval then shows once
+        the agent is back).
+        """
+        config = {"configurable": {"thread_id": thread_id}}
+        if self.ready is not None:
+            snapshot = await self.ready.agent.aget_state(config)
+            values = snapshot.values if isinstance(snapshot.values, Mapping) else {}
+            return list(values.get("messages") or []), _pending_interrupt(snapshot)
+        saved = await (await self.checkpointer()).aget_tuple(config)
+        if saved is None:
+            return [], None
+        return list(saved.checkpoint.get("channel_values", {}).get("messages") or []), None
+
     # -- agent ---------------------------------------------------------------------------------
 
     async def ensure_ready(self) -> _Ready:
@@ -408,8 +492,9 @@ class AgentRuntime:
             if self.ready is not None:
                 return self.ready
             try:
+                checkpointer = await self.checkpointer()
                 pre = await asyncio.to_thread(self._preflight)
-                ready = _Ready(pre, self._assemble(pre))
+                ready = _Ready(pre, self._assemble(pre, checkpointer))
             except Exception as exc:
                 self.last_error = friendly_error(exc)
                 raise
@@ -433,21 +518,19 @@ class AgentRuntime:
             log.info("%s", pre.probe.detail)
         return pre
 
-    def _assemble(self, pre: Preflight) -> CompiledStateGraph[Any, Any, Any, Any]:
-        from langgraph.checkpoint.memory import InMemorySaver
-
+    def _assemble(
+        self, pre: Preflight, checkpointer: BaseCheckpointSaver
+    ) -> CompiledStateGraph[Any, Any, Any, Any]:
         from mimoe_agent.agent import build_agent
         from mimoe_agent.tools import build_tools
 
-        if self._checkpointer is None:
-            self._checkpointer = InMemorySaver()  # shared by every build: threads survive a switch
         settings = dataclasses.replace(self.settings, model=pre.model.id)
         return build_agent(
             settings,
             pre,
             llm=self._model_factory(settings, pre),
             tools=build_tools(settings, self.client),
-            checkpointer=self._checkpointer,
+            checkpointer=checkpointer,
         )
 
     # -- reports -------------------------------------------------------------------------------
@@ -571,8 +654,9 @@ class AgentRuntime:
                 self.model_id = model_id
                 self.ready = None  # the previous agent may point at an unloaded model
                 try:
+                    checkpointer = await self.checkpointer()
                     pre = await asyncio.to_thread(self._preflight)
-                    self.ready = _Ready(pre, self._assemble(pre))
+                    self.ready = _Ready(pre, self._assemble(pre, checkpointer))
                 except Exception as exc:
                     self.last_error = friendly_error(exc)
                     raise _http(502, *self.last_error) from exc
@@ -596,6 +680,7 @@ def create_app(
     client: MimoeClient | None = None,
     model_factory: ModelFactory | None = None,
     web_dist: Path | None = None,
+    history: Path | None = None,
 ) -> FastAPI:
     """Build the FastAPI application.
 
@@ -608,6 +693,8 @@ def create_app(
             :func:`mimoe_agent.llm.make_model`. Tests inject the fake engine's HTTP clients.
         web_dist: The built web UI to serve at ``/``; defaults to the checkout's ``web/dist``.
             When the directory is missing ``/`` answers with a JSON hint instead.
+        history: The SQLite file for conversations (checkpoints and titles); ``None`` keeps
+            them in memory. ``serve`` passes :func:`mimoe_agent.config.history_path`.
 
     Returns:
         The app. Its runtime state is at ``app.state.runtime`` (:class:`AgentRuntime`).
@@ -622,7 +709,7 @@ def create_app(
 
         model_factory = make_model
     engine_client = client or MimoeClient(settings.base_url, settings.api_key)
-    runtime = AgentRuntime(settings, engine_client, model_factory)
+    runtime = AgentRuntime(settings, engine_client, model_factory, history)
     dist = web_dist if web_dist is not None else DEFAULT_WEB_DIST
 
     @asynccontextmanager
@@ -632,6 +719,7 @@ def create_app(
         except Exception as exc:
             log.warning("not ready yet: %s", _error_text(friendly_error(exc)))
         yield
+        await runtime.close()
 
     app = FastAPI(title="mimoe-agent", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.runtime = runtime
@@ -664,6 +752,7 @@ def create_app(
             snapshot = await ready.agent.aget_state(config)
             if _pending_interrupt(snapshot) is not None:
                 raise _http(409, "an approval is pending on this thread", HINT_APPROVAL_PENDING)
+            await runtime.conversations.touch(body.thread_id, body.message)
             payload = {"messages": [HumanMessage(body.message)]}
             ids = runtime.tool_ids(body.thread_id, new_turn=True)
             events = aiter_events(ready.agent, payload, turn.config(config), tool_ids=ids)
@@ -687,6 +776,7 @@ def create_app(
             if interrupt.id != body.interrupt_id:
                 raise _http(409, "stale interrupt id", HINT_STALE_INTERRUPT)
             decisions = _decisions(body.decisions, interrupt.value)
+            await runtime.conversations.touch(body.thread_id)
             payload = Command(resume={"decisions": decisions})
             ids = runtime.tool_ids(body.thread_id, new_turn=False)
             events = aiter_events(ready.agent, payload, turn.config(config), tool_ids=ids)
@@ -706,6 +796,63 @@ def create_app(
     @app.post("/api/model")
     async def switch(body: ModelBody) -> dict[str, Any]:
         return await runtime.switch(body.model, unload_previous=body.unload_previous)
+
+    thread_path = PathParam(min_length=1, max_length=MAX_THREAD_ID_LENGTH)
+
+    @app.get("/api/threads")
+    async def threads() -> dict[str, Any]:
+        return {"threads": [c.summary() for c in await runtime.conversations.list()]}
+
+    @app.get("/api/threads/{thread_id}")
+    async def thread(thread_id: str = thread_path) -> dict[str, Any]:
+        conversation = await runtime.conversations.get(thread_id)
+        messages, interrupt = await runtime.thread_state(thread_id)
+        if conversation is None and not messages:
+            raise _http(404, f"no conversation {thread_id}", HINT_NO_THREAD)
+        pending = interrupt.value if interrupt is not None else None
+        pending = pending if isinstance(pending, Mapping) else None
+        turns, ids = transcript(messages, pending)
+        lock = runtime._locks.get(thread_id)
+        busy = lock is not None and lock.locked()
+        if pending is not None and not busy:
+            runtime.adopt_tool_ids(thread_id, ids)
+        if conversation is not None:
+            summary = conversation.summary()
+        else:  # checkpoints without a row (a thread of an older build): title from the start
+            first = next((turn["text"] for turn in turns if turn["role"] == "user"), "")
+            summary = {"id": thread_id, "title": title_from(first)}
+            summary |= {"created_at": None, "updated_at": None}
+        approval = None
+        if interrupt is not None and pending is not None:
+            approval = {
+                "interrupt_id": interrupt.id,
+                "action_requests": list(pending.get("action_requests") or []),
+            }
+        return {**summary, "turns": turns, "approval": approval, "busy": busy}
+
+    @app.patch("/api/threads/{thread_id}")
+    async def rename(body: RenameBody, thread_id: str = thread_path) -> dict[str, Any]:
+        if not body.title.strip():
+            raise _http(422, "title is empty", HINT_TITLE)
+        conversation = await runtime.conversations.rename(thread_id, body.title)
+        if conversation is None:
+            raise _http(404, f"no conversation {thread_id}", HINT_NO_THREAD)
+        return conversation.summary()
+
+    @app.delete("/api/threads/{thread_id}", status_code=204)
+    async def delete(thread_id: str = thread_path) -> Response:
+        turn = await runtime.begin(thread_id)  # 409 while it runs: the run would write it back
+        try:
+            known = await runtime.conversations.get(thread_id) is not None
+            messages, _ = await runtime.thread_state(thread_id)
+            if not known and not messages:
+                raise _http(404, f"no conversation {thread_id}", HINT_NO_THREAD)
+            await (await runtime.checkpointer()).adelete_thread(thread_id)
+            await runtime.conversations.delete(thread_id)
+        finally:
+            turn.release()
+        runtime.forget(thread_id)
+        return Response(status_code=204)
 
     @app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def unknown(rest: str) -> None:
@@ -730,7 +877,13 @@ def create_app(
 def run(settings: Settings, port: int) -> None:
     """Serve :func:`create_app` on ``127.0.0.1:port`` (loopback only; there is no host flag)."""
     _configure_logging()
-    uvicorn.run(create_app(settings), host=BIND_HOST, port=port, log_level="info")
+    history = history_path(settings)
+    if history is None:
+        log.info("conversations are kept in memory until the server stops (--history off)")
+    else:
+        log.info("conversations are saved in %s", history)
+    app = create_app(settings, history=history)
+    uvicorn.run(app, host=BIND_HOST, port=port, log_level="info")
 
 
 def _configure_logging() -> None:

@@ -15,11 +15,12 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 ENV_PREFIX = "MIMOE_"
-STRING_FIELDS: tuple[str, ...] = ("base_url", "api_key", "model", "workspace")
+STRING_FIELDS: tuple[str, ...] = ("base_url", "api_key", "model", "workspace", "history")
 BOOL_FIELDS: tuple[str, ...] = ("think", "auto_approve", "allow_network", "force_tools", "trace")
 FIELDS: tuple[str, ...] = STRING_FIELDS + BOOL_FIELDS
-DOTENV_FIELDS: tuple[str, ...] = STRING_FIELDS
-"""Only these four keys are read from ``.env``; booleans come from flags or the real environment."""
+DOTENV_FIELDS: tuple[str, ...] = ("base_url", "api_key", "model", "workspace")
+"""Only these four keys are read from ``.env``; booleans and ``history`` (where conversations are
+written) come from flags or the real environment."""
 DEFAULT_API_KEY = "1234"
 TRACING_ENV_VARS: tuple[str, ...] = (
     "LANGSMITH_TRACING",
@@ -58,6 +59,9 @@ class Settings:
     trace: bool
     sources: Mapping[str, str]
     """Field name -> ``"flag"`` | ``"env"`` | ``".env"`` | ``"default"``."""
+    history: str | None = None
+    """Where ``serve`` keeps conversations: a file path, ``"off"`` for memory only, or ``None``
+    for the per-user default (see :func:`history_path`)."""
 
 
 def env_name(field: str) -> str:
@@ -137,7 +141,25 @@ def load_settings(
         force_tools=bools["force_tools"],
         trace=bools["trace"],
         sources=sources,
+        history=_optional_str(raw["history"]),
     )
+
+
+def history_path(settings: Settings) -> Path | None:
+    """The SQLite file ``serve`` keeps conversations in, or ``None`` to keep them in memory.
+
+    ``--history off`` (or ``0``/``false``/``no``) means memory; a path is used as given (``~``
+    expanded); nothing given means the per-user default of
+    :func:`mimoe_agent.history.default_history_path`.
+    """
+    from mimoe_agent.history import default_history_path
+
+    value = settings.history
+    if value is None:
+        return default_history_path()
+    if value.strip().lower() in _FALSE:
+        return None
+    return Path(value).expanduser().resolve()
 
 
 def apply_tracing_env(settings: Settings) -> None:

@@ -290,10 +290,17 @@ def main(
 def serve(
     ctx: typer.Context,
     port: int = typer.Option(8000, "--port", help="Port on 127.0.0.1 for the web UI."),
+    history: str | None = typer.Option(
+        None,
+        "--history",
+        help="SQLite file for the conversation history, or 'off' to keep conversations in "
+        "memory [env MIMOE_HISTORY; default: the per-user data folder].",
+        show_default=False,
+    ),
 ) -> None:
     """Run the FastAPI server and the web chat UI on http://127.0.0.1:PORT (loopback only)."""
     _reconfigure_streams()
-    settings = _settings_or_exit(_overrides(ctx))
+    settings = _settings_or_exit({**_overrides(ctx), "history": history})
     apply_tracing_env(settings)
     from mimoe_agent import server  # after apply_tracing_env: the server imports LangChain
 

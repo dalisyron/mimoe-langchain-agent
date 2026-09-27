@@ -15,6 +15,7 @@ import asyncio
 import dataclasses
 import json
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -103,7 +104,9 @@ class Harness:
         self.fake.calls.clear()
 
 
-def make_harness(fake: FakeMimoe, settings: Settings, dist: Path) -> Harness:
+def make_harness(
+    fake: FakeMimoe, settings: Settings, dist: Path, history: Path | None = None
+) -> Harness:
     transport = GatedTransport(fake)
 
     def model_factory(s: Settings, pre: Preflight) -> Any:
@@ -115,7 +118,9 @@ def make_harness(fake: FakeMimoe, settings: Settings, dist: Path) -> Harness:
         )
 
     engine = MimoeClient(settings.base_url, settings.api_key, client=fake.client())
-    app = create_app(settings, client=engine, model_factory=model_factory, web_dist=dist)
+    app = create_app(
+        settings, client=engine, model_factory=model_factory, web_dist=dist, history=history
+    )
     return Harness(fake, settings, app, transport)
 
 
@@ -956,3 +961,134 @@ def test_default_handlers_are_the_shared_ones() -> None:
 
     factory: Callable[..., Any] = default_factory
     assert factory is make_model
+
+
+# -- conversation history -------------------------------------------------------------------------
+
+
+async def test_a_conversation_is_listed_and_reopens_as_it_streamed(harness: Harness) -> None:
+    async with harness.client() as client:
+        await harness.prime()
+        harness.fake.script(LIST_FILES, {"content": "There are files."})
+        live = sse_events((await chat(client, "t1", "What files are here?")).text)
+        listed = (await client.get("/api/threads")).json()["threads"]
+        assert [(t["id"], t["title"]) for t in listed] == [("t1", "What files are here?")]
+        thread = (await client.get("/api/threads/t1")).json()
+        assert thread["approval"] is None and thread["busy"] is False
+        user, assistant = thread["turns"]
+        assert user == {"role": "user", "text": "What files are here?"}
+        tool, text = assistant["blocks"]
+        call = next(event for event in live if event["event"] == "tool_call")
+        assert (tool["id"], tool["name"], tool["args"]) == (call["id"], "list_files", {"path": "."})
+        assert tool["status"] == "done" and "notes.md" in tool["result"]
+        assert text == {"kind": "text", "text": "There are files."}
+        assert assistant["stats"] == {"model": "qwen3-4b", "usage": live[-1]["usage_total"]}
+
+
+async def test_rename_and_delete_a_conversation(harness: Harness) -> None:
+    async with harness.client() as client:
+        await harness.prime()
+        harness.fake.script({"content": "Hi."}, {"content": "Fresh start."})
+        await chat(client, "t1", "hello")
+        renamed = await client.patch("/api/threads/t1", json={"title": "  Greetings\n "})
+        assert renamed.status_code == 200 and renamed.json()["title"] == "Greetings"
+        assert (await client.get("/api/threads")).json()["threads"][0]["title"] == "Greetings"
+        empty = await client.patch("/api/threads/t1", json={"title": "  "})
+        assert empty.status_code == 422 and detail(empty)["message"] == "title is empty"
+        assert (await client.patch("/api/threads/nope", json={"title": "x"})).status_code == 404
+
+        assert (await client.delete("/api/threads/t1")).status_code == 204
+        assert (await client.get("/api/threads/t1")).status_code == 404
+        assert (await client.get("/api/threads")).json() == {"threads": []}
+        assert (await client.delete("/api/threads/t1")).status_code == 404
+        await chat(client, "t1", "again")  # the id starts over: the model sees one message
+        sent = harness.fake.calls[-1]["messages"]
+        assert [m["role"] for m in sent] == ["system", "user"]
+
+
+async def test_a_conversation_cannot_be_deleted_while_it_runs(harness: Harness) -> None:
+    async with harness.client() as client:
+        await harness.prime()
+        harness.fake.script({"content": "Slow."})
+        harness.transport.gate.clear()
+        harness.transport.arrived.clear()
+        running = asyncio.create_task(chat(client, "t1", "hello"))
+        await harness.transport.arrived.wait()
+        refused = await client.delete("/api/threads/t1")
+        assert refused.status_code == 409 and detail(refused)["hint"] == HINT_RUN_IN_PROGRESS
+        assert (await client.get("/api/threads/t1")).json()["busy"] is True
+        harness.transport.gate.set()
+        assert (await running).status_code == 200
+        assert (await client.delete("/api/threads/t1")).status_code == 204
+
+
+async def test_unknown_and_malformed_thread_ids(harness: Harness) -> None:
+    async with harness.client() as client:
+        missing = await client.get("/api/threads/nope")
+        assert missing.status_code == 404 and "/api/threads" in detail(missing)["hint"]
+        too_long = await client.get("/api/threads/" + "x" * 201)
+        assert too_long.status_code == 422
+
+
+async def test_a_pending_approval_reopens_and_resumes(harness: Harness) -> None:
+    async with harness.client() as client:
+        await harness.prime()
+        harness.fake.script(RUN_PYTHON, {"content": "6*7 is 42."})
+        first = sse_events((await chat(client, "t1", "Use run_python to print 6*7")).text)
+        interrupt_id = first[1]["interrupt_id"]
+        thread = (await client.get("/api/threads/t1")).json()
+        assert thread["approval"]["interrupt_id"] == interrupt_id
+        assert thread["approval"]["action_requests"][0]["args"] == {"code": "print(6*7)"}
+        [block] = thread["turns"][1]["blocks"]
+        assert block["status"] == "awaiting_approval" and "result" not in block
+        second = sse_events((await resume(client, "t1", interrupt_id, ["approve"])).text)
+        assert second[0]["event"] == "tool_result" and second[0]["id"] == block["id"]
+        reopened = (await client.get("/api/threads/t1")).json()
+        assert reopened["approval"] is None
+        assert reopened["turns"][1]["blocks"][0]["status"] == "done"
+        assert reopened["turns"][1]["blocks"][1] == {"kind": "text", "text": "6*7 is 42."}
+
+
+async def test_history_survives_a_restart_with_an_approval_pending(
+    fake_mimoe: FakeMimoe, settings_tmp: Settings, tmp_path: Path
+) -> None:
+    """The SQLite file holds the checkpoints and the titles: a new server lists the conversation,
+    shows the pending approval and resumes it; the result lands on the restored tool call."""
+    db = tmp_path / "history" / "conversations.sqlite"
+    first = make_harness(fake_mimoe, settings_tmp, tmp_path / "dist", history=db)
+    try:
+        async with first.client() as client:
+            await first.prime()
+            fake_mimoe.script({"content": "Hi."}, RUN_PYTHON)
+            await chat(client, "t1", "hello")
+            events = sse_events((await chat(client, "t1", "Use run_python to print 6*7")).text)
+            interrupt_id = events[1]["interrupt_id"]
+    finally:
+        await first.runtime.close()
+
+    second = make_harness(fake_mimoe, settings_tmp, tmp_path / "dist", history=db)
+    try:
+        async with second.client() as client:
+            listed = (await client.get("/api/threads")).json()["threads"]
+            assert [(t["id"], t["title"]) for t in listed] == [("t1", "hello")]
+            before = (await client.get("/api/threads/t1")).json()  # engine not probed yet
+            assert [t["role"] for t in before["turns"]] == [
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+            ]
+            await second.prime()
+            thread = (await client.get("/api/threads/t1")).json()
+            assert thread["approval"]["interrupt_id"] == interrupt_id
+            block = thread["turns"][3]["blocks"][0]
+            assert block["status"] == "awaiting_approval"
+            fake_mimoe.script({"content": "6*7 is 42."})
+            resumed = sse_events((await resume(client, "t1", interrupt_id, ["approve"])).text)
+            result = next(event for event in resumed if event["event"] == "tool_result")
+            assert result["id"] == block["id"] and "42" in result["content"]
+            assert text_of(resumed) == "6*7 is 42."
+    finally:
+        await second.runtime.close()
+    if sys.platform != "win32":
+        assert (db.stat().st_mode & 0o777) == 0o600
