@@ -1,9 +1,10 @@
 # Web UI session against the real server (D3)
 
-> Later change (2026-09-25): tool calls now show as one muted line each ("Read notes.md",
+> Later changes (2026-09-25/26): tool calls now show as one muted line each ("Read notes.md",
 > "Calculating failed, trying a different approach"), with the arguments and the result one click
-> away, instead of the cards with status chips described below. The SSE frames and the server
-> behaviour recorded here are unchanged.
+> away, instead of the cards with status chips described below; the UI was then redesigned (a
+> sidebar of saved conversations, a model menu, light and dark themes). The SSE frames and the
+> chat, approval and model-switch behaviour recorded here are unchanged.
 
 Date: 2026-09-25. Engine: mimOE Studio 0.6.5 at `http://localhost:8083/mimik-ai/openai/v1`
 (engine v3.22.8 developer edition, node MacBookPro.lan) with `qwen3-4b` loaded; thinking off, `max_tokens`

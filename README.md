@@ -28,15 +28,17 @@ the run and asks you to approve or deny the code, in the terminal and in the bro
 executes. Everything is on-device: the
 model runs in mimOE Studio (the agent never picks a cloud or provider model that Studio may also
 list), the agent's own tools never open a network connection, and the web server only listens on
-`127.0.0.1`.
+`127.0.0.1`. The web UI keeps your conversations on this computer and lists them in a sidebar,
+like ChatGPT's or Claude's, where you can search, rename and delete them; a reload or a server
+restart reopens them, a pending approval included.
 
-![The web UI on start: engine badge, model picker and the five demo prompts](docs/img/web-empty-state.png)
+![The web UI: saved conversations on the left, the model menu at the top, the demo prompts in the middle](docs/img/web-empty-state.png)
 
 ![run_python asks for approval before the code runs](docs/img/web-approval-panel.png)
 
 ![After Approve: the tool call as one line (click it for the code and its output), the answer and the stats for the turn](docs/img/web-approved-answer.png)
 
-![A failed tool call is one line too: the calculator refused a loop, so the agent ran Python instead and answered](docs/img/web-failed-step.png)
+![A saved conversation reopened from the sidebar in the dark theme, with the tool call's result opened](docs/img/web-history-dark.png)
 
 ## Quickstart
 
@@ -183,7 +185,8 @@ Two lines of LangGraph vocabulary, since `create_agent` compiles to a LangGraph 
 
 - **Thread** and **checkpoint**: a thread is one conversation, identified by a `thread_id`; after
   every step the graph saves its state (the messages so far and any pending interrupt) as a
-  checkpoint in an `InMemorySaver`, so a run can stop and continue later.
+  checkpoint, so a run can stop and continue later. The web server keeps checkpoints in SQLite
+  (`AsyncSqliteSaver`), so conversations survive a restart; the REPL keeps them in memory.
 - **Interrupt** and **resume**: `HumanInTheLoopMiddleware` raises an interrupt when the model calls
   `run_python`; the run ends with the state saved and the request reported to you; a later
   `Command(resume={"decisions": [...]})` on the same thread continues the graph from exactly that
@@ -197,10 +200,10 @@ Two lines of LangGraph vocabulary, since `create_agent` compiles to a LangGraph 
 | `ChatOpenAI` from langchain-openai, plus a handful of mimOE adjustments: chat completions pinned (`use_responses_api=False`), the token cap sent as `max_tokens` in `extra_body` (ChatOpenAI renames it to `max_completion_tokens`, which mimOE ignores), `timeout=200` and `max_retries=0` (above the engine's 180 s limit; never replay a timed-out inference), `httpx` clients with `trust_env=False` (a proxy variable must not capture localhost), and a small subclass that keeps the `reasoning_content` field 1.0 engines send. | The endpoint is OpenAI-compatible except for exactly these quirks, and each one is a one-line fix in the constructor. | A custom `httpx` client: I would have re-implemented streaming, tool-call delta assembly and the error classes, for no gain. |
 | Built-in `HumanInTheLoopMiddleware` on `run_python` | The pause survives across requests through the checkpoint, behaves identically in the CLI and the web UI, and the library validates the decision shape. | A prompt-only rule ("ask before running code"): a 4B model forgets instructions, and a safety boundary has to live in code, not in the prompt. |
 | FastAPI + Server-Sent Events (`sse-starlette`) | Two POSTs (`/api/chat`, `/api/resume`) that stream events; plain HTTP you can `curl -N`; nothing to keep alive between requests. | WebSockets: bidirectional, but nothing here needs the client to talk mid-stream, and an approval is naturally a second request. SSE is easier to test and debug. |
-| React + Vite + TypeScript with the built bundle committed in `web/dist` | The reviewer needs no Node.js; the UI is about 750 lines with no UI kit, and the reducer, SSE parser and stream consumer have vitest tests. | Streamlit or Gradio: fast to start, but the per-turn tool cards, the approval panel with one decision per request, Stop and resume did not fit their request/rerun model. |
+| React + Vite + TypeScript, styled with Tailwind CSS and shadcn/ui-style components (Radix for the menus, lucide icons), with the built bundle committed in `web/dist` | The reviewer needs no Node.js; the components are copied in rather than a UI framework, nothing loads from the internet (system fonts, no CDN), and the reducer, SSE parser, stream consumer, tool steps, sidebar grouping and Markdown safety have vitest tests. | Streamlit or Gradio: the per-turn tool steps, the approval panel with one decision per request, Stop and resume did not fit their request/rerun model. LangChain's agent-chat-ui: polished, but it talks only to a LangGraph Server, whose default accepts requests from any website (it could start a run and approve its own code), needs Node to run, and renders images from model output. |
 | uv | One command installs Python 3.13 and the locked dependencies on macOS, Windows and Linux; `uv run mimoe-agent` is the whole quickstart. | pip or poetry: pip needs a Python 3.13 and a venv first; poetry is one more tool to install. |
 | Plain `@tool` functions, with pandas available to `run_python` | Eight ordinary functions whose docstrings are the descriptions the model reads; pandas because the model reaches for it every time and gets CSVs right (my csv-module fallback miscounted the header row). | RAG, a vector store or SQLite: the workspace is small, `read_file`/`search_files`/`run_python` answer everything, and an index is more setup, more dependencies and one more thing that can be stale. |
-| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 718 tests run on CI without Studio; eight live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
+| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 742 tests run on CI without Studio; eight live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
 | Python 3.13 as the floor | The workspace jail uses `ntpath.isreserved` (new in 3.13) and `Path.is_junction` (3.12) for Windows; uv installs 3.13 anyway. | Supporting 3.10 to 3.12 with fallbacks: more code paths to test on Windows for no benefit to the reviewer. |
 
 ## How the components connect
@@ -215,7 +218,7 @@ flowchart TB
     ST["stream.py: graph output to events"]
     subgraph AGENT["agent.py: create_agent graph"]
         MW["middleware: compute reminder, Qwen cleanup, guardrails, 8-call limit, approval on run_python"]
-        CK[("InMemorySaver: one checkpoint per thread")]
+        CK[("checkpoints per thread: SQLite for the web UI, memory for the REPL")]
     end
     TOOLS["tools/: 8 tools"]
     WS[("workspace/")]
@@ -274,8 +277,14 @@ What each module does, in reading order:
   and Python delivers Ctrl-C only to the main thread; Ctrl-C sets the turn's cancel signal.
 - `server.py`: the HTTP API below, one `asyncio.Lock` per thread, lazy start (the server comes up
   even when Studio is down and reports the hint in `/api/health`), and the static bundle.
+- `history.py`: the conversation history. One SQLite file holds LangGraph's checkpoints and a small
+  table of titles and times for the sidebar; `transcript()` turns a reopened thread's messages
+  back into the turns the UI drew while they streamed (tool-call ids and a pending approval
+  included, so a resume after a restart lands on the right call).
 - `web/src`: `events.ts` (the wire types), `sse.ts` (parser), `api.ts`, `reducer.ts` (events to
-  ordered blocks per assistant turn), `useChat.ts`, and the components.
+  ordered blocks per assistant turn), `useChat.ts` and `useThreads.ts`, `threads.ts` (sidebar
+  grouping), and the components (`Sidebar`, `TopBar`, `ModelMenu`, `Transcript`, `ToolCard`,
+  `ApprovalPanel`, `Composer`).
 
 The HTTP API and the events (the full contract is in `docs/CONTRACTS.md`):
 
@@ -285,6 +294,9 @@ The HTTP API and the events (the full contract is in `docs/CONTRACTS.md`):
 | `POST /api/resume` | `{thread_id, interrupt_id, decisions: ["approve" or "reject", ...]}` | SSE stream; 409 if nothing is pending or the id is stale, 422 if the decisions do not fit |
 | `GET /api/health` | | model, tokens/s, context, engine version and generation, workspace, mode `tools` or `chat_only`, and the error hint when Studio is not usable |
 | `GET /api/models`, `POST /api/model` | `{model, unload_previous}` | list loaded and registered models; switch, re-probe and rebuild the agent |
+| `GET /api/threads` | | the saved conversations, most recently used first: `{id, title, created_at, updated_at}` |
+| `GET /api/threads/{id}` | | one conversation's turns as the UI draws them, and its pending approval, if any |
+| `PATCH /api/threads/{id}`, `DELETE /api/threads/{id}` | `{title}` | rename; delete the conversation and its checkpoints (409 while it runs) |
 | `GET /` | | the committed `web/dist` |
 
 | Event | Payload | When |
@@ -466,6 +478,11 @@ The agent's own tools never touch the network. Code you approve runs as you, wit
 with `--allow-network`, your network. The approval prompt is the only boundary. `--auto-approve`
 means trust-the-model. File contents are untrusted input.
 
+The web server saves every conversation, including the file contents and tool output the agent
+saw, in a SQLite file only your user can read (created 0600 in a 0700 folder on macOS and Linux).
+Deleting a conversation in the sidebar removes its checkpoints too; `serve --history off` keeps
+nothing on disk. The REPL never writes a history.
+
 What `run_python` does to keep accidents small (none of it is a sandbox):
 
 - The code runs in a fresh interpreter (`python -X utf8 -u -P _runner.py`) with the workspace as
@@ -549,6 +566,7 @@ silent `false`. `.env.example` lists the keys.
 | Force tools | `--force-tools` | `MIMOE_FORCE_TOOLS` | no | off; skips the probe and offers the tools anyway |
 | Tracing | `--trace` | `MIMOE_TRACE` | no | off; keeps LangSmith variables as they are |
 | Web port | `serve --port` | | | 8000, loopback only |
+| Conversation history | `serve --history PATH` (`off` keeps it in memory) | `MIMOE_HISTORY` | no | `conversations.sqlite` in the per-user data folder: `~/Library/Application Support/mimoe-agent/` on macOS, `%LOCALAPPDATA%\mimoe-agent\` on Windows, `~/.local/share/mimoe-agent/` on Linux |
 
 Exit codes of the REPL: 0 after `/quit` or EOF, 1 for a configuration or preflight failure (the
 hint is on stderr), 130 for Ctrl-C at the prompt. Piped input works
@@ -559,10 +577,10 @@ hint is on stderr), 130 for Ctrl-C at the prompt. Piped input works
 
 ```bash
 uv sync                                   # dependencies plus the dev group
-uv run pytest -q                          # 718 offline tests against the fake engine, no Studio needed
+uv run pytest -q                          # 742 offline tests against the fake engine, no Studio needed
 MIMOE_LIVE=1 uv run pytest -m live        # 8 live tests against a running Studio (a handful of completions)
 uvx ruff check . && uvx ruff format --check .
-cd web && npm ci && npm test && npm run build   # 35 vitest tests; the build writes web/dist
+cd web && npm ci && npm test && npm run build   # 41 vitest tests; the build writes web/dist
 ```
 
 The committed bundle: `web/dist` is in git so that reviewers do not need Node.js. After a UI change
@@ -620,9 +638,9 @@ a diff I could not explain did not go in.
 
 ## Limitations and next steps
 
-- No persistence across restarts. Threads live in an `InMemorySaver`; a page reload or `/new`
-  starts a new conversation, and an approval that was pending when the server restarted cannot be
-  resumed (the resume answers 409). Next step: a SQLite checkpointer.
+- Only the web UI saves conversations; the REPL keeps them in memory and `/new` starts over. A
+  conversation's title is its first message (rename it in the sidebar): a model-written title
+  would cost an extra model call per conversation on a laptop CPU.
 - No `fetch_url` tool yet. I cut it from this version; the design I want is a per-URL approval like
   `run_python`, IP pinning against SSRF (resolve once, refuse private ranges, connect to that
   address), a wall-clock limit and a size cap.
@@ -639,7 +657,9 @@ a diff I could not explain did not go in.
   that contain a number, 5 of 7 small sums in my replay went to a tool; the two answered from
   memory were right, but a 4B model can still get arithmetic wrong that way, so trust numbers that
   came from a tool. When it writes a file, it sometimes keeps a relative date ("two days from now")
-  or overwrites an existing file; the approval shows the code before anything runs.
+  or overwrites an existing file; the approval shows the code before anything runs. Asked to
+  "read the notes file", it guesses `notes.txt`, is told the file does not exist (it is
+  `notes.md`) and stops there instead of listing the folder.
 - Cancelling a turn closes the model stream, but Studio 0.6.5 has no cancel and keeps generating
   the abandoned answer for a moment, so the next prompt can wait a few seconds.
 - Single-user loopback server: no authentication, per-thread locks kept for the process lifetime,
