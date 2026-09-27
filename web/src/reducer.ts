@@ -11,7 +11,8 @@ export type Block =
   | { kind: 'notice'; text: string }
   | { kind: 'error'; message: string; hint?: string };
 
-export type Stats = { elapsed_s: number; model: string; usage?: Usage | null };
+/** Per assistant turn; a reopened conversation has no elapsed time and may not know the model. */
+export type Stats = { elapsed_s?: number; model: string | null; usage?: Usage | null };
 /** Result shown on a tool card that was still running when its run ended without a result. */
 export const RUN_ENDED = 'no result: the run ended before the tool reported back';
 export type AssistantTurn = { role: 'assistant'; blocks: Block[]; stats?: Stats };
@@ -66,7 +67,7 @@ function addStats(prev: Stats | undefined, done: { elapsed_s: number; model: str
           llm_calls: prev.usage.llm_calls + usage.llm_calls,
         }
       : (usage ?? prev.usage);
-  return { elapsed_s: prev.elapsed_s + done.elapsed_s, model: done.model, usage: sum };
+  return { elapsed_s: (prev.elapsed_s ?? 0) + done.elapsed_s, model: done.model, usage: sum };
 }
 
 /** Tools still running when a run ends without their result cannot report back any more. */
@@ -123,5 +124,7 @@ export function reducer(state: ChatState, action: Action): ChatState {
       };
     case 'reset':
       return initialState(action.threadId);
+    case 'load':
+      return { threadId: action.threadId, turns: action.turns, streaming: false, approval: action.approval };
   }
 }

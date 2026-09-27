@@ -63,7 +63,8 @@ describe('tool steps: one plain line per call', () => {
 
   it('renders the line collapsed; the arguments and the error open on click', () => {
     const html = renderToStaticMarkup(createElement(ToolCard, { block: step({ status: 'error', result: REFUSED }), retrying: true }));
-    expect(html).toContain('<details class="step step-error"><summary>Calculating failed, trying a different approach</summary>');
+    expect(html).toMatch(/^<details class="disclosure[^"]*" data-status="error"><summary/);
+    expect(html).toContain('<span class="truncate">Calculating failed, trying a different approach</span>');
     expect(html).not.toContain('open=');
     expect(html).toContain('ERROR: the calculator evaluates one arithmetic expression'); // one click away
   });

@@ -1,83 +1,49 @@
-:root {
-  --bg: #f6f7f9; --panel: #fff; --text: #1a1d21; --muted: #667085; --border: #e3e6ea;
-  --accent: #2f6fed; --accent-text: #fff; --user: #e8effd; --ok: #1f9d55; --bad: #d92d20; --warn: #f79009;
-  color-scheme: light dark;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 15px;
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* Dark mode follows the `dark` class on <html> (theme.ts: light, dark or the system setting). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* System fonts only: the UI works offline and loads nothing from the internet. */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #0f1115; --panel: #171a21; --text: #e6e8eb; --muted: #98a2b3; --border: #2a2f3a; --user: #1e2a44; }
+
+@layer base {
+  html { color-scheme: light; }
+  html.dark { color-scheme: dark; }
+  body {
+    @apply bg-white text-zinc-900 antialiased dark:bg-zinc-950 dark:text-zinc-100;
+  }
+  ::selection { @apply bg-zinc-900/15 dark:bg-white/20; }
+  /* Thin scrollbars that match the surfaces. */
+  * { scrollbar-width: thin; scrollbar-color: rgb(161 161 170 / 0.45) transparent; }
 }
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); }
-.app { max-width: 880px; margin: 0 auto; min-height: 100vh; display: flex; flex-direction: column; padding: 0 16px; }
 
-/* header */
-header { position: sticky; top: 0; z-index: 1; background: var(--bg); border-bottom: 1px solid var(--border); padding: 10px 0; }
-.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-h1 { font-size: 16px; margin: 0; }
-.badge { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
-.badge .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; }
-.row.controls { margin-top: 8px; }
-.row.controls > button { margin-left: auto; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); flex: none; }
-.dot.ok { background: var(--ok); }
-.hint { color: var(--bad); font-size: 13px; margin-top: 6px; white-space: pre-wrap; }
-.picker { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
-.picker label { white-space: nowrap; }
-select { font: inherit; font-size: 12px; max-width: 220px; padding: 4px 6px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }
-.status.ok { color: var(--ok); } .status.bad { color: var(--bad); }
-.status.busy::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; border: 2px solid var(--muted); border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
+@layer components {
+  /* Assistant answers (Markdown.tsx adds the prose classes). */
+  .answer > :first-child { margin-top: 0; }
+  .answer > :last-child { margin-bottom: 0; }
+  .answer :where(table) { @apply block overflow-x-auto; }
 
-/* controls */
-button { font: inherit; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; }
-button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
-button.danger { background: var(--bad); color: #fff; border-color: var(--bad); }
-button.link { border: 0; background: none; color: var(--accent); padding: 2px 0; text-align: left; vertical-align: top; }
-button:disabled { opacity: .5; cursor: default; }
-.chip { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--border); white-space: nowrap; }
-.chip.ok { background: color-mix(in srgb, var(--ok) 25%, transparent); }
-.chip.warn { background: color-mix(in srgb, var(--warn) 30%, transparent); white-space: normal; }
-.chip.danger { background: color-mix(in srgb, var(--bad) 30%, transparent); white-space: normal; }
-.muted { color: var(--muted); font-size: 12px; align-self: center; }
+  /* One muted line per tool call; the details open on click (ToolCard, Thinking). */
+  .disclosure > summary { list-style: none; }
+  .disclosure > summary::-webkit-details-marker { display: none; }
+}
 
-/* transcript */
-.transcript { flex: 1; display: flex; flex-direction: column; gap: 12px; padding: 16px 0; }
-.empty { color: var(--muted); }
-.empty ul { padding-left: 20px; }
-.turn { border-radius: 12px; padding: 10px 14px; line-height: 1.5; max-width: 100%; overflow-wrap: anywhere; }
-.turn.user { background: var(--user); align-self: flex-end; white-space: pre-wrap; }
-.turn.assistant { background: var(--panel); border: 1px solid var(--border); }
-.turn.assistant > p:first-child { margin-top: 0; }
-.turn.assistant > p:last-of-type { margin-bottom: 0; }
-pre { background: color-mix(in srgb, var(--bg) 70%, var(--panel)); border-radius: 8px; padding: 10px; overflow-x: auto; font-size: 13px; margin: 8px 0; }
-code { font-size: 13px; }
-table { border-collapse: collapse; } td, th { border: 1px solid var(--border); padding: 4px 8px; }
-/* thinking and tool steps: one muted line each; the details open on click */
-.thinking, .step { margin: 6px 0; font-size: 13px; color: var(--muted); }
-.thinking summary, .step summary { cursor: pointer; width: fit-content; }
-.thinking summary:hover, .step summary:hover { color: var(--text); }
-.thinking pre { white-space: pre-wrap; }
-.step-running summary::after { content: ""; display: inline-block; width: 8px; height: 8px; margin-left: 8px; vertical-align: -1px; border: 2px solid var(--muted); border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
-.step-awaiting_approval summary { color: var(--text); }
-.step-detail { margin: 4px 0 8px 16px; }
-.step-detail pre { margin: 6px 0; }
-.step .result { max-height: 280px; overflow: auto; white-space: pre-wrap; }
-.tool-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.notice { color: var(--warn); font-size: 13px; border-left: 3px solid var(--warn); padding: 4px 8px; margin: 8px 0; }
-.error { border: 1px solid var(--bad); color: var(--bad); border-radius: 8px; padding: 8px 12px; margin: 8px 0; white-space: pre-wrap; }
-.stats { color: var(--muted); font-size: 12px; margin-top: 6px; }
-.cursor::after { content: "▍"; animation: blink 1s steps(2) infinite; }
+/* Prism tokens (react-syntax-highlighter with class names instead of inline styles), in both themes. */
+@layer components {
+  .code-block .token.comment, .code-block .token.prolog, .code-block .token.doctype { @apply text-zinc-400 italic dark:text-zinc-500; }
+  .code-block .token.keyword, .code-block .token.boolean, .code-block .token.important { @apply text-violet-700 dark:text-violet-300; }
+  .code-block .token.string, .code-block .token.char, .code-block .token.attr-value { @apply text-emerald-700 dark:text-emerald-300; }
+  .code-block .token.number, .code-block .token.constant, .code-block .token.symbol { @apply text-amber-700 dark:text-amber-300; }
+  .code-block .token.function, .code-block .token.class-name { @apply text-blue-700 dark:text-sky-300; }
+  .code-block .token.builtin, .code-block .token.decorator, .code-block .token.annotation { @apply text-cyan-700 dark:text-cyan-300; }
+  .code-block .token.operator, .code-block .token.punctuation { @apply text-zinc-500 dark:text-zinc-400; }
+  .code-block .token.property, .code-block .token.tag, .code-block .token.attr-name { @apply text-rose-700 dark:text-rose-300; }
+  .code-block .token.inserted { @apply text-emerald-700 dark:text-emerald-300; }
+  .code-block .token.deleted { @apply text-red-700 dark:text-red-300; }
+}
+
 @keyframes blink { 50% { opacity: 0; } }
-
-/* approval */
-.approval { border: 1px solid var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--panel)); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; }
-.approval p { margin: 0 0 8px; }
-.request { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin: 8px 0; background: var(--panel); }
-.request.approve { border-color: var(--ok); } .request.reject { border-color: var(--bad); }
-.actions { display: flex; gap: 8px; margin-top: 8px; }
-
-/* composer */
-footer { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0 16px; }
-.composer { display: flex; gap: 8px; align-items: flex-end; }
-textarea { flex: 1; font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--panel); color: var(--text); resize: vertical; }

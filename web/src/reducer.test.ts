@@ -201,4 +201,28 @@ describe('reducer: errors, stop, reset', () => {
     expect(reducer(s, { type: 'stopped' })).toBe(s); // idempotent when nothing streams
     expect(reducer(s, { type: 'reset', threadId: 't2' })).toEqual(initialState('t2'));
   });
+
+  it('load replaces the conversation with a saved one, its pending approval included', () => {
+    const streaming = replay([{ type: 'send', text: 'first' }]);
+    const turns = [
+      { role: 'user' as const, text: 'Use run_python to print 6*7' },
+      {
+        role: 'assistant' as const,
+        blocks: [{ kind: 'tool' as const, id: 'tool_0', name: 'run_python', args: { code: 'print(6*7)' }, status: 'awaiting_approval' as const }],
+        stats: { model: null, usage: { input_tokens: 10, output_tokens: 5, llm_calls: 1 } },
+      },
+    ];
+    const approval = { interruptId: 'abc', requests: [{ name: 'run_python', args: { code: 'print(6*7)' } }] };
+    const s = reducer(streaming, { type: 'load', threadId: 'saved', turns, approval });
+    expect(s).toEqual({ threadId: 'saved', turns, streaming: false, approval });
+    // the resume's events continue the restored turn: the result lands on the restored call
+    const resumed = replay([
+      { type: 'decided', decisions: ['approve'] },
+      { type: 'tool_result', id: 'tool_0', name: 'run_python', content: '42', is_error: false },
+      done(),
+    ], s);
+    expect(assistant(resumed).blocks).toEqual([{ ...turns[1].blocks![0], status: 'done', result: '42' }]);
+    expect(assistant(resumed).stats?.elapsed_s).toBe(2.5); // restored stats have no elapsed time
+    expect(assistant(resumed).stats?.usage?.llm_calls).toBe(3);
+  });
 });

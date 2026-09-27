@@ -14,6 +14,9 @@ Scenarios are picked by keywords in the message (case-insensitive):
 - ``error`` / ``boom``: partial text, then an ``error`` event
 
 ``FAKE_MIMOE_DOWN=1`` simulates an unreachable Studio (health hint, chat answers with an error).
+
+Conversations are kept in memory for the sidebar (``/api/threads``): every event a run sends is
+recorded into turns the way the web UI's reducer draws them, so reopening one looks as it streamed.
 """
 
 from __future__ import annotations
@@ -23,12 +26,13 @@ import json
 import os
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -74,12 +78,27 @@ class Pending:
     codes: list[str]
 
 
+@dataclass
+class Conversation:
+    """A sidebar row and its turns, recorded from the events the runs sent."""
+
+    id: str
+    title: str
+    created_at: str
+    updated_at: str
+    turns: list[dict[str, Any]] = field(default_factory=list)
+
+    def summary(self) -> dict[str, Any]:
+        return {k: getattr(self, k) for k in ("id", "title", "created_at", "updated_at")}
+
+
 class State:
-    """Mutable server state: current model, per-thread locks and pending approvals."""
+    """Mutable server state: current model, per-thread locks, pending approvals, conversations."""
 
     model: str = "qwen3-4b"
     locks: dict[str, asyncio.Lock] = {}
     pending: dict[str, Pending] = {}
+    threads: dict[str, Conversation] = {}
 
     @classmethod
     def lock(cls, thread_id: str) -> asyncio.Lock:
@@ -100,6 +119,10 @@ class ResumeBody(BaseModel):
 class ModelBody(BaseModel):
     model: str
     unload_previous: bool = True
+
+
+class RenameBody(BaseModel):
+    title: str
 
 
 Event = dict[str, str]
@@ -272,10 +295,56 @@ async def resume_turn(p: Pending, decisions: list[str]) -> AsyncIterator[Event]:
     yield done("completed", 4.2, 2)
 
 
+def now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def record(thread_id: str, frame: Event) -> None:
+    """Add one event to the thread's last assistant turn, as web/src/reducer.ts would."""
+    conversation = State.threads.get(thread_id)
+    if conversation is None or not conversation.turns:
+        return
+    name, data = frame["event"], json.loads(frame["data"])
+    turn = conversation.turns[-1]
+    blocks: list[dict[str, Any]] = turn["blocks"]
+    tools = [b for b in blocks if b["kind"] == "tool"]
+    if name in ("token", "thinking"):
+        kind = "text" if name == "token" else "thinking"
+        if blocks and blocks[-1]["kind"] == kind:
+            blocks[-1]["text"] += data["text"]
+        else:
+            blocks.append({"kind": kind, "text": data["text"]})
+    elif name == "tool_call":
+        blocks.append({"kind": "tool", "status": "running", **data})
+    elif name == "tool_result":
+        for b in tools:
+            if b["id"] == data["id"]:
+                failed = "error" if data["is_error"] else "done"
+                b.update(
+                    result=data["content"], status="denied" if b["status"] == "denied" else failed
+                )
+    elif name == "approval_required":
+        for r in data["action_requests"]:
+            waiting = next(
+                (b for b in tools if b["status"] == "running" and b["name"] == r["name"]), None
+            )
+            if waiting is not None:
+                waiting["status"] = "awaiting_approval"
+    elif name == "notice":
+        blocks.append({"kind": "notice", "text": data["text"]})
+    elif name == "done":
+        turn["stats"] = {
+            "elapsed_s": data["elapsed_s"],
+            "model": data["model"],
+            "usage": data["usage_total"],
+        }
+
+
 async def locked(thread_id: str, events: AsyncIterator[Event]) -> AsyncIterator[Event]:
     """Serialise runs per thread; a client disconnect cancels the generator and frees the lock."""
     async with State.lock(thread_id):
         async for e in events:
+            record(thread_id, e)
             yield e
 
 
@@ -365,6 +434,18 @@ async def chat(body: ChatBody) -> EventSourceResponse:
                 "interrupt_id": p.interrupt_id,
             },
         )
+    conversation = State.threads.get(body.thread_id)
+    if conversation is None:
+        title = " ".join(body.message.split())
+        title = title if len(title) <= 60 else title[:59].rstrip() + "…"
+        conversation = State.threads[body.thread_id] = Conversation(
+            body.thread_id, title, now(), now()
+        )
+    conversation.updated_at = now()
+    conversation.turns += [
+        {"role": "user", "text": body.message},
+        {"role": "assistant", "blocks": []},
+    ]
     return EventSourceResponse(
         locked(body.thread_id, scenario(body.thread_id, body.message)), ping=5
     )
@@ -391,7 +472,64 @@ async def resume(body: ResumeBody) -> EventSourceResponse:
             },
         )
     del State.pending[body.thread_id]
+    if (conversation := State.threads.get(body.thread_id)) is not None:
+        conversation.updated_at = now()
+        waiting = [
+            b for b in conversation.turns[-1]["blocks"] if b.get("status") == "awaiting_approval"
+        ]
+        for block, decision in zip(waiting, body.decisions, strict=False):
+            block["status"] = "running" if decision == "approve" else "denied"
     return EventSourceResponse(locked(body.thread_id, resume_turn(p, body.decisions)), ping=5)
+
+
+@app.get("/api/threads")
+async def threads() -> dict[str, Any]:
+    rows = sorted(State.threads.values(), key=lambda c: c.updated_at, reverse=True)
+    return {"threads": [c.summary() for c in rows]}
+
+
+def conversation_or_404(thread_id: str) -> Conversation:
+    if (conversation := State.threads.get(thread_id)) is None:
+        raise HTTPException(
+            404, {"message": f"no conversation {thread_id}", "hint": "GET /api/threads"}
+        )
+    return conversation
+
+
+@app.get("/api/threads/{thread_id}")
+async def thread(thread_id: str) -> dict[str, Any]:
+    conversation = conversation_or_404(thread_id)
+    p = State.pending.get(thread_id)
+    approval = None
+    if p is not None:
+        requests = [{"name": "run_python", "args": {"code": c}} for c in p.codes]
+        approval = {"interrupt_id": p.interrupt_id, "action_requests": requests}
+    busy = State.lock(thread_id).locked()
+    return {
+        **conversation.summary(),
+        "turns": conversation.turns,
+        "approval": approval,
+        "busy": busy,
+    }
+
+
+@app.patch("/api/threads/{thread_id}")
+async def rename(thread_id: str, body: RenameBody) -> dict[str, Any]:
+    conversation = conversation_or_404(thread_id)
+    if not body.title.strip():
+        raise HTTPException(422, {"message": "title is empty", "hint": "send a title"})
+    conversation.title = " ".join(body.title.split())[:200]
+    return conversation.summary()
+
+
+@app.delete("/api/threads/{thread_id}", status_code=204)
+async def delete(thread_id: str) -> Response:
+    conversation_or_404(thread_id)
+    if State.lock(thread_id).locked():
+        raise HTTPException(409, {"message": "a run is in progress", "hint": "wait for it"})
+    del State.threads[thread_id]
+    State.pending.pop(thread_id, None)
+    return Response(status_code=204)
 
 
 # Like the real server: the built UI is mounted after the API routes, only when it exists.

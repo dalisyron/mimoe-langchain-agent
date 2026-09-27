@@ -1,4 +1,5 @@
 /// <reference types="vitest/config" />
+import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 
@@ -6,10 +7,11 @@ import { defineConfig } from 'vite';
 // CORS; changeOrigin rewrites the Host header so TrustedHostMiddleware accepts proxied calls).
 // Prod: `vite build` writes web/dist, which `mimoe-agent serve` mounts at "/".
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   server: {
     proxy: { '/api': { target: process.env.API_URL ?? 'http://127.0.0.1:8000', changeOrigin: true } },
   },
-  build: { outDir: 'dist', emptyOutDir: true },
+  // One bundle (about 190 kB gzipped) served from localhost: splitting would only add files to web/dist.
+  build: { outDir: 'dist', emptyOutDir: true, chunkSizeWarningLimit: 800 },
   test: { environment: 'node', include: ['src/**/*.test.ts'] },
 });

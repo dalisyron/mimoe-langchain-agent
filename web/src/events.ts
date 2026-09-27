@@ -1,3 +1,5 @@
+import type { Approval, Turn } from './reducer';
+
 // Wire contract with the FastAPI backend (docs/CONTRACTS.md, "server.py").
 // Each SSE frame is `event: <name>` + `data: <json>`; api.ts folds them into `{ type: <name>, ...json }`.
 
@@ -28,7 +30,8 @@ export type ClientAction =
   | { type: 'decided'; decisions: Decision[] }
   | { type: 'stream_failed'; message: string; hint?: string } // HTTP 409/422 or a network failure
   | { type: 'stopped' }
-  | { type: 'reset'; threadId: string };
+  | { type: 'reset'; threadId: string }
+  | { type: 'load'; threadId: string; turns: Turn[]; approval: Approval | null }; // a saved conversation, reopened
 
 export type Action = ServerEvent | ClientAction;
 

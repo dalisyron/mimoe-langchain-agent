@@ -2,6 +2,7 @@ import { useCallback, useReducer, useRef } from 'react';
 import { HttpError, api } from './api';
 import type { Action, Decision, ServerEvent } from './events';
 import { initialState, reducer } from './reducer';
+import { toApproval, type ThreadDetail } from './threads';
 
 // crypto.randomUUID needs a secure context; http://127.0.0.1 and localhost qualify.
 const newThreadId = (): string =>
@@ -36,6 +37,7 @@ export async function consumeStream(events: AsyncIterable<ServerEvent>, dispatch
 export function useChat() {
   const [state, dispatch] = useReducer(reducer, undefined, () => initialState(newThreadId()));
   const abort = useRef<AbortController | null>(null);
+  const opening = useRef(0); // only the latest open() may load: clicks can outrun the server
 
   const newSignal = useCallback(() => {
     abort.current?.abort();
@@ -56,6 +58,15 @@ export function useChat() {
     void consumeStream(api.resume(state.threadId, interruptId, decisions, signal), dispatch, signal);
   };
   const stop = () => { abort.current?.abort(); dispatch({ type: 'stopped' }); };
-  const reset = () => { abort.current?.abort(); dispatch({ type: 'reset', threadId: newThreadId() }); };
-  return { state, send, decide, stop, reset };
+  const reset = () => { opening.current += 1; abort.current?.abort(); dispatch({ type: 'reset', threadId: newThreadId() }); };
+  /** Reopen a saved conversation (a running stream is stopped, as New chat does). Throws on 404. */
+  const open = async (threadId: string): Promise<ThreadDetail | null> => {
+    const ticket = ++opening.current;
+    abort.current?.abort();
+    const detail = await api.thread(threadId);
+    if (ticket !== opening.current) return null; // another conversation was chosen meanwhile
+    dispatch({ type: 'load', threadId, turns: detail.turns, approval: toApproval(detail) });
+    return detail;
+  };
+  return { state, send, decide, stop, reset, open };
 }

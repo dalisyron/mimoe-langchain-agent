@@ -1,5 +1,6 @@
 import { SERVER_EVENT_TYPES, type Decision, type Health, type Json, type Models, type ServerEvent, type SwitchResult } from './events';
 import { parseSSE } from './sse';
+import type { ThreadDetail, ThreadSummary } from './threads';
 
 /** A non-2xx response; `hint` comes from FastAPI's `{detail: {message, hint}}` shape when present. */
 export class HttpError extends Error {
@@ -39,11 +40,15 @@ async function* stream(path: string, body: Json, signal: AbortSignal): AsyncGene
   }
 }
 
-async function json<T>(path: string, body?: Json): Promise<T> {
-  const res = await fetch(path, body === undefined ? {} : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+async function json<T>(path: string, body?: Json, method = body === undefined ? 'GET' : 'POST'): Promise<T> {
+  const init: RequestInit = { method };
+  if (body !== undefined) Object.assign(init, { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const res = await fetch(path, init);
   if (!res.ok) throw await toHttpError(res);
-  return (await res.json()) as T;
+  return (res.status === 204 ? undefined : await res.json()) as T;
 }
+
+const threadPath = (id: string) => `/api/threads/${encodeURIComponent(id)}`;
 
 export const api = {
   chat: (threadId: string, message: string, signal: AbortSignal) =>
@@ -54,4 +59,8 @@ export const api = {
   models: () => json<Models>('/api/models'),
   switchModel: (model: string, unloadPrevious: boolean) =>
     json<SwitchResult>('/api/model', { model, unload_previous: unloadPrevious }),
+  threads: () => json<{ threads: ThreadSummary[] }>('/api/threads'),
+  thread: (id: string) => json<ThreadDetail>(threadPath(id)),
+  renameThread: (id: string, title: string) => json<ThreadSummary>(threadPath(id), { title }, 'PATCH'),
+  deleteThread: (id: string) => json<void>(threadPath(id), undefined, 'DELETE'),
 };
