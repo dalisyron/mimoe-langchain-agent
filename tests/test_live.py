@@ -1,9 +1,10 @@
 """Live smoke tests against a running mimOE Studio.
 
 Skipped unless ``MIMOE_LIVE=1`` (and selected with ``-m live``, which ``addopts`` excludes by
-default). Budget: about fifteen completions in total: one REPL session with one prompt (probe +
-tool call + answer), three replayed steps (probe + one completion each) and two agent turns
-(probe + at most two completions each); the preflight test skips the probe with ``force_tools``.
+default). Budget: about twenty completions in total: one REPL session with one prompt (probe +
+tool call + answer), three replayed steps (probe + one completion each) and three agent turns
+(probe + at most three completions each); the preflight test skips the probe with
+``force_tools``.
 
 ``MIMOE_BASE_URL`` / ``MIMOE_API_KEY`` are read at import time because the autouse
 ``_clean_mimoe_env`` fixture strips every ``MIMOE_*`` variable before a test runs.
@@ -224,3 +225,12 @@ def test_the_real_agent_offers_to_write_the_reminder(workspace_tmp: Path) -> Non
     code = approvals[0]["action_requests"][0]["args"]["code"]
     assert "reminders" in code and ("open(" in code or "write" in code), code
     assert not list(workspace_tmp.glob("reminders*"))  # waiting for approval: nothing ran
+
+
+def test_the_real_agent_reads_the_file_it_first_guessed_wrong(tmp_path: Path) -> None:
+    """A real web-session request: for "the notes file" the model tries notes.txt and, told only
+    that it does not exist, gave up. With the did-you-mean hint it reads notes.md. Runs on the
+    sample workspace (read-only tools): with a temporary path the model looked first instead."""
+    events = _turn(_settings(REPO_WORKSPACE, tmp_path), "Read the notes file in my workspace")
+    reads = [e for e in events if e["event"] == "tool_result" and e["name"] == "read_file"]
+    assert any("Week 38" in e["content"] for e in reads), events

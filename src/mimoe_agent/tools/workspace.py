@@ -18,6 +18,7 @@ import sys
 import time
 import unicodedata
 from collections.abc import Callable, Iterator
+from difflib import SequenceMatcher
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from langchain_core.tools import BaseTool, StructuredTool
@@ -289,6 +290,66 @@ def _walk(start: Path, max_depth: int) -> Iterator[tuple[Path, list[tuple[str, s
         yield here, subdirs, sorted(filenames)
 
 
+MAX_SUGGEST_NAMES = 5_000  # workspace names compared for a "did you mean" hint
+MAX_SUGGEST_DEPTH = 6
+SUGGEST_CUTOFF = 0.7  # how alike two names without extensions must be to count as "close"
+
+
+def _closest(wanted: str, candidates: list[str], limit: int = 3) -> list[str]:
+    """The workspace paths most like ``wanted``, best first, ignoring case: the same path in
+    another case, the same name in another folder, the same name with another extension, then
+    the closest spelling of the name without its extension (a shared ``.py`` or folder is not
+    a likeness)."""
+    want = PurePosixPath(wanted.lower())
+    scored: list[tuple[float, str]] = []
+    for candidate in candidates:
+        path = PurePosixPath(candidate.lower())
+        if path == want:
+            score = 1.0
+        elif path.name == want.name:
+            score = 0.95
+        elif path.stem == want.stem:
+            score = 0.9
+        else:
+            score = SequenceMatcher(None, path.stem, want.stem).ratio()
+        if score >= SUGGEST_CUTOFF:
+            scored.append((score, candidate))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [candidate for _, candidate in scored[:limit]]
+
+
+_HINT_ACTIONS = {"file": ("file", "read"), "dir": ("folder", "list"), "any": ("path", "search")}
+
+
+def _did_you_mean(ws: Workspace, missing: Path, want: str) -> str:
+    """``"; did you mean 'notes.md'? If that is the file the user means, read it."`` for a path
+    that does not exist, or ``""`` when nothing is close.
+
+    Told only that ``notes.txt`` does not exist, qwen3-4b-instruct-2507 gave up on "read the
+    notes file"; with "did you mean 'notes.md'?" it asked the user whether to read that, and only
+    the added "If that is the file the user means, read it." made it read the file (one replayed
+    step each, temperature 0). Candidates come from the walk ``list_files`` uses (no symlinks,
+    no ``.git`` or ``node_modules``): files for ``want="file"`` (never credential files), folders
+    for ``"dir"``, both for ``"any"``.
+    """
+    names: list[str] = []
+    for here, subdirs, files in _walk(ws.root, MAX_SUGGEST_DEPTH):
+        found = [] if want == "dir" else [n for n in files if not _is_secret(n)]
+        if want != "file":
+            found += [n for n, kind in subdirs if kind in ("dir", "deep")]
+        names += [ws.rel(here / name) for name in found]
+        if len(names) >= MAX_SUGGEST_NAMES:
+            break
+    picks = [repr(p) for p in _closest(ws.rel(missing), names[:MAX_SUGGEST_NAMES])]
+    if not picks:
+        return ""
+    noun, verb = _HINT_ACTIONS[want]
+    if len(picks) == 1:
+        return f"; did you mean {picks[0]}? If that is the {noun} the user means, {verb} it."
+    listed = f"{', '.join(picks[:-1])} or {picks[-1]}"
+    return f"; did you mean {listed}? If one of them is the {noun} the user means, {verb} it."
+
+
 class _Output:
     """Collects result lines under a character budget so a short footer always fits."""
 
@@ -318,7 +379,7 @@ def _list_files(ws: Workspace, path: str, max_depth: int) -> str:
     except WorkspaceError as exc:
         return f"error: {exc}"
     if not start.exists():
-        return f"error: {path!r} does not exist in the workspace"
+        return f"error: {path!r} does not exist in the workspace{_did_you_mean(ws, start, 'dir')}"
     if not start.is_dir():
         return f"error: {path!r} is a file, not a directory; use read_file"
     depth = _clamp(_to_int(max_depth, 4), 1, MAX_LIST_DEPTH)
@@ -385,7 +446,7 @@ def _read_file(ws: Workspace, path: str, offset: int, limit: int) -> str:
     if _is_secret(target.name):
         return f"error: {path!r} looks like a secrets file (its name matches a secret pattern)"
     if not target.exists():
-        return f"error: {path!r} does not exist in the workspace"
+        return f"error: {path!r} does not exist in the workspace{_did_you_mean(ws, target, 'file')}"
     if target.is_dir():
         return f"error: {path!r} is a directory; use list_files"
     if not target.is_file():
@@ -451,7 +512,7 @@ def _search_files(ws: Workspace, pattern: str, path: str, glob: str, max_results
     except WorkspaceError as exc:
         return f"error: {exc}"
     if not start.exists():
-        return f"error: {path!r} does not exist in the workspace"
+        return f"error: {path!r} does not exist in the workspace{_did_you_mean(ws, start, 'any')}"
     needle = pattern.lower()
     name_glob = (str(glob).strip() or "*").lower()
     name_glob = name_glob.removeprefix("**/") or "*"  # "**/*.py" must also match top-level files

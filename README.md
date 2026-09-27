@@ -203,7 +203,7 @@ Two lines of LangGraph vocabulary, since `create_agent` compiles to a LangGraph 
 | React + Vite + TypeScript, styled with Tailwind CSS and shadcn/ui-style components (Radix for the menus, lucide icons), with the built bundle committed in `web/dist` | The reviewer needs no Node.js; the components are copied in rather than a UI framework, nothing loads from the internet (system fonts, no CDN), and the reducer, SSE parser, stream consumer, tool steps, sidebar grouping and Markdown safety have vitest tests. | Streamlit or Gradio: the per-turn tool steps, the approval panel with one decision per request, Stop and resume did not fit their request/rerun model. LangChain's agent-chat-ui: polished, but it talks only to a LangGraph Server, whose default accepts requests from any website (it could start a run and approve its own code), needs Node to run, and renders images from model output. |
 | uv | One command installs Python 3.13 and the locked dependencies on macOS, Windows and Linux; `uv run mimoe-agent` is the whole quickstart. | pip or poetry: pip needs a Python 3.13 and a venv first; poetry is one more tool to install. |
 | Plain `@tool` functions, with pandas available to `run_python` | Eight ordinary functions whose docstrings are the descriptions the model reads; pandas because the model reaches for it every time and gets CSVs right (my csv-module fallback miscounted the header row). | RAG, a vector store or SQLite: the workspace is small, `read_file`/`search_files`/`run_python` answer everything, and an index is more setup, more dependencies and one more thing that can be stale. |
-| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 742 tests run on CI without Studio; eight live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
+| An in-process fake engine for tests (`httpx.MockTransport` injected into ChatOpenAI and the engine client) | It reproduces the quirks of both engine generations (inline `<think>`, `reasoning_content`, `tool_0` ids, the error bodies, the model store), so 748 tests run on CI without Studio; nine live tests sit behind `MIMOE_LIVE=1`. | Recorded cassettes (VCR-style): brittle against streaming chunk boundaries, awkward to script a tool call followed by an answer, and tied to one engine version. |
 | Python 3.13 as the floor | The workspace jail uses `ntpath.isreserved` (new in 3.13) and `Path.is_junction` (3.12) for Windows; uv installs 3.13 anyway. | Supporting 3.10 to 3.12 with fallbacks: more code paths to test on Windows for no benefit to the reviewer. |
 
 ## How the components connect
@@ -519,7 +519,10 @@ The other tools:
   files (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `credentials`, `.netrc`, `token.json` and
   similar, matched after Unicode normalisation and case folding) are refused, as are binaries and
   files over 2 MB. The jail is by path, so a workspace's `.git/config` is readable by `read_file`,
-  and approved Python can of course read anything you can.
+  and approved Python can of course read anything you can. A path that does not exist gets the
+  closest workspace names in its error ("did you mean 'notes.md'? If that is the file the user
+  means, read it."), never a credential file or anything behind a symlink: the model guesses
+  names, and told only that its guess did not exist it gave up.
 - `git` is read-only (`status`, `log`, `diff`) and runs without a shell, pager or prompt. It runs
   none of the repository's own code: hooks are pointed at the null device (`status` and `diff`
   rewrite the index, which fires `post-index-change`), filter drivers from the repository's config
@@ -577,8 +580,8 @@ hint is on stderr), 130 for Ctrl-C at the prompt. Piped input works
 
 ```bash
 uv sync                                   # dependencies plus the dev group
-uv run pytest -q                          # 742 offline tests against the fake engine, no Studio needed
-MIMOE_LIVE=1 uv run pytest -m live        # 8 live tests against a running Studio (a handful of completions)
+uv run pytest -q                          # 748 offline tests against the fake engine, no Studio needed
+MIMOE_LIVE=1 uv run pytest -m live        # 9 live tests against a running Studio (a handful of completions)
 uvx ruff check . && uvx ruff format --check .
 cd web && npm ci && npm test && npm run build   # 41 vitest tests; the build writes web/dist
 ```
@@ -657,9 +660,9 @@ a diff I could not explain did not go in.
   that contain a number, 5 of 7 small sums in my replay went to a tool; the two answered from
   memory were right, but a 4B model can still get arithmetic wrong that way, so trust numbers that
   came from a tool. When it writes a file, it sometimes keeps a relative date ("two days from now")
-  or overwrites an existing file; the approval shows the code before anything runs. Asked to
-  "read the notes file", it guesses `notes.txt`, is told the file does not exist (it is
-  `notes.md`) and stops there instead of listing the folder.
+  or overwrites an existing file; the approval shows the code before anything runs. It also
+  guesses file names ("the notes file" becomes `notes.txt`); the did-you-mean hint in the error
+  gets it to `notes.md`, which a bare "does not exist" did not.
 - Cancelling a turn closes the model stream, but Studio 0.6.5 has no cancel and keeps generating
   the abandoned answer for a moment, so the next prompt can wait a few seconds.
 - Single-user loopback server: no authentication, per-thread locks kept for the process lifetime,

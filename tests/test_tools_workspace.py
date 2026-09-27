@@ -249,6 +249,66 @@ class TestWorkspaceJail:
         assert ws.rel(ws.root) == "."
 
 
+# --- did you mean ------------------------------------------------------------------------------
+
+
+class TestDidYouMean:
+    """A missing path gets the closest workspace names: the model guesses names ("the notes file"
+    -> notes.txt) and, told only that the file does not exist, gave up instead of looking."""
+
+    def test_read_file_names_the_closest_file_and_says_to_read_it(self, tools: Tools) -> None:
+        assert read(tools, "notes.txt") == (
+            "error: 'notes.txt' does not exist in the workspace; did you mean 'notes.md'? "
+            "If that is the file the user means, read it."
+        )
+        assert "did you mean 'src/app.py'?" in read(tools, "app.py")  # same name, other folder
+        assert "did you mean 'src/utils.py'?" in read(tools, "src/util.py")  # a typo
+        assert "did you mean 'data/sales.csv'?" in read(tools, "data/sale.csv")
+
+    def test_list_and_search_suggest_folders_and_paths(self, tools: Tools) -> None:
+        assert list_(tools, path="dat").endswith(
+            "did you mean 'data'? If that is the folder the user means, list it."
+        )
+        assert search(tools, "x", path="src/util.py").endswith(
+            "did you mean 'src/utils.py'? If that is the path the user means, search it."
+        )
+
+    def test_nothing_close_means_no_hint(self, tools: Tools) -> None:
+        assert read(tools, "todo.txt") == "error: 'todo.txt' does not exist in the workspace"
+        assert "did you mean" not in read(tools, "src/main.py")  # a shared folder is no likeness
+
+    def test_several_close_names(self, root: Path, tools: Tools) -> None:
+        for name in ("report.csv", "data/reports.csv", "data/report.xlsx"):
+            write(root, name, "x")
+        assert read(tools, "data/report.csv").endswith(
+            "did you mean 'report.csv', 'data/reports.csv' or 'data/report.xlsx'? "
+            "If one of them is the file the user means, read it."
+        )
+
+    def test_never_suggests_credentials_skipped_or_linked_folders(
+        self, root: Path, tmp_path: Path, tools: Tools
+    ) -> None:
+        write(root, ".env", "TOKEN=1")
+        write(root, "node_modules/notes.txt", "x")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "plan.md").write_text("private")
+        symlink_or_skip(outside, root / "linked")
+        assert "did you mean" not in read(tools, "env")  # .env is close, but a credential file
+        assert "node_modules" not in read(tools, "notes.txt")
+        assert "did you mean" not in read(tools, "plan.md")  # linked/plan.md is not walked
+
+    def test_closest_ranks_case_folder_extension_then_spelling(self) -> None:
+        names = ["readme.md", "notez.md", "notes.txt", "docs/notes.md", "Notes.MD"]
+        assert wsmod._closest("notes.md", names) == ["Notes.MD", "docs/notes.md", "notes.txt"]
+        assert wsmod._closest("notes.md", names, limit=5) == [
+            "Notes.MD",
+            "docs/notes.md",
+            "notes.txt",
+            "notez.md",
+        ]
+
+
 # --- tool wiring -----------------------------------------------------------------------------
 
 
