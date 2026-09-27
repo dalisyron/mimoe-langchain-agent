@@ -276,7 +276,8 @@ What each module does, in reading order:
   while the REPL thread renders its events, because LangGraph runs graph nodes on pool threads
   and Python delivers Ctrl-C only to the main thread; Ctrl-C sets the turn's cancel signal.
 - `server.py`: the HTTP API below, one `asyncio.Lock` per thread, lazy start (the server comes up
-  even when Studio is down and reports the hint in `/api/health`), and the static bundle.
+  even when Studio is down and reports the hint in `/api/health`), and the static bundle (the page
+  is revalidated on every load, so a new build shows at once; the hashed scripts are cached).
 - `history.py`: the conversation history. One SQLite file holds LangGraph's checkpoints and a small
   table of titles and times for the sidebar; `transcript()` turns a reopened thread's messages
   back into the turns the UI drew while they streamed (tool-call ids and a pending approval

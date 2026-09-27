@@ -211,7 +211,7 @@ does), `approval` is `{interrupt_id, action_requests}` while one is pending, els
 -> 204 (checkpoints and title; 409 while a run holds the thread, 404 unknown). `create_app(...,
 history: Path | None = None)`: one SQLite file for `AsyncSqliteSaver` and the `conversations` table
 (0600 in a 0700 folder on POSIX), memory when None; `serve` passes `history_path(settings)`.
-`GET /` serves `web/dist` (StaticFiles, html=True) mounted after the API routes.
+`GET /` serves `web/dist` (StaticFiles, html=True) mounted after the API routes; `Cache-Control: no-cache` on every file except the content-hashed `assets/*` (`public, max-age=31536000, immutable`), so a new build shows on the next load.
 `TrustedHostMiddleware(allowed_hosts=["127.0.0.1", "localhost", "[::1]"])`; uvicorn binds 127.0.0.1.
 SSE frames: `event: <name>\ndata: <json>\n\n`; keep-alive comment every 15 s.
 

@@ -48,7 +48,7 @@ import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 import anyio
@@ -671,6 +671,25 @@ class AgentRuntime:
         }
 
 
+class _Bundle(StaticFiles):
+    """The built web UI, with cache headers a browser cannot misread.
+
+    With only ``ETag`` and ``Last-Modified`` a browser caches ``index.html`` heuristically and
+    keeps showing the previous build after an update (it did, for a whole redesign). So every
+    file is ``no-cache`` (revalidated on each load, a 304 while unchanged) except the
+    content-hashed files under ``assets/``: a build gives them new names, so they are cached
+    for a year.
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        hashed = PurePath(path).parts[:1] == ("assets",) and response.status_code == 200
+        response.headers["cache-control"] = (
+            "public, max-age=31536000, immutable" if hashed else "no-cache"
+        )
+        return response
+
+
 # -- app ------------------------------------------------------------------------------------------
 
 
@@ -864,7 +883,7 @@ def create_app(
         # the UI stays blank. The bundle's own types are fixed here.
         mimetypes.add_type("text/javascript", ".js")
         mimetypes.add_type("text/css", ".css")
-        app.mount("/", StaticFiles(directory=dist, html=True), name="ui")
+        app.mount("/", _Bundle(directory=dist, html=True), name="ui")
     else:
 
         @app.get("/")

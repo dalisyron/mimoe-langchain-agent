@@ -789,8 +789,12 @@ async def test_static_bundle_is_served_after_the_api_routes(
         root = await client.get("/")
         assert root.status_code == 200 and "<title>ui</title>" in root.text
         assert root.headers["content-type"].startswith("text/html")
+        assert root.headers["cache-control"] == "no-cache"  # a new build shows on the next load
         asset = await client.get("/assets/app.js")
         assert asset.status_code == 200 and "javascript" in asset.headers["content-type"]
+        assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
+        gone = await client.get("/assets/old-build.js")
+        assert gone.status_code == 404 and "immutable" not in gone.headers.get("cache-control", "")
         assert (await client.get("/api/health")).status_code == 200
         missing = await client.get("/api/nope")
         assert missing.status_code == 404
