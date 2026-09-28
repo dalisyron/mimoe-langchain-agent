@@ -61,6 +61,7 @@ Two lines of LangGraph vocabulary, since `create_agent` compiles to a LangGraph 
 | `ChatOpenAI` from langchain-openai, plus a handful of mimOE adjustments: chat completions pinned (`use_responses_api=False`), the token cap sent as `max_tokens` in `extra_body` (ChatOpenAI renames it to `max_completion_tokens`, which mimOE ignores), `timeout=200` and `max_retries=0` (above the engine's 180 s limit; never replay a timed-out inference), `httpx` clients with `trust_env=False` (a proxy variable must not capture localhost), and a small subclass that keeps the `reasoning_content` field 1.0 engines send. | The endpoint is OpenAI-compatible except for exactly these quirks, and each one is a one-line fix in the constructor. | A custom `httpx` client: I would have re-implemented streaming, tool-call delta assembly and the error classes, for no gain. |
 | Built-in `HumanInTheLoopMiddleware` on `run_python` | The pause survives across requests through the checkpoint, behaves identically in the CLI and the web UI, and the library validates the decision shape. | A prompt-only rule ("ask before running code"): a 4B model forgets instructions, and a safety boundary has to live in code, not in the prompt. |
 | FastAPI + Server-Sent Events (`sse-starlette`) | Two POSTs (`/api/chat`, `/api/resume`) that stream events; plain HTTP you can `curl -N`; nothing to keep alive between requests. | WebSockets: bidirectional, but nothing here needs the client to talk mid-stream, and an approval is naturally a second request. SSE is easier to test and debug. |
+| typer and rich for the REPL, prompt_toolkit for its input | rich renders the Markdown answers, the spinner and the tables. prompt_toolkit draws the `you>` prompt itself, so Backspace and Ctrl-U stop at the prompt, and it reads single keys for the Yes/No approval menu the same way on macOS, Linux and Windows. | Python's `input()` with readline, as before: rich printed the prompt, and libedit (the readline of the macOS Pythons uv installs) blanked the whole row on Backspace; handing libedit the prompt kept the text but dropped its colours, and Windows has no readline. Reading raw keys myself would need termios and msvcrt code and escape-sequence parsing. |
 | React + Vite + TypeScript, styled with Tailwind CSS and shadcn/ui-style components (Radix for the menus, lucide icons), with the built bundle committed in `web/dist` | The reviewer needs no Node.js; the components are copied in rather than a UI framework, nothing loads from the internet (system fonts, no CDN), and the reducer, SSE parser, stream consumer, tool steps, sidebar grouping and Markdown safety have vitest tests. | Streamlit or Gradio: the per-turn tool steps, the approval panel with one decision per request, Stop and resume did not fit their request/rerun model. LangChain's agent-chat-ui: polished, but it talks only to a LangGraph Server, whose default accepts requests from any website (it could start a run and approve its own code), needs Node to run, and renders images from model output. |
 | uv | One command installs Python 3.13 and the locked dependencies on macOS, Windows and Linux; `uv run mimoe-agent` is the whole quickstart. | pip or poetry: pip needs a Python 3.13 and a venv first; poetry is one more tool to install. |
 | Plain `@tool` functions, with pandas available to `run_python` | Eight ordinary functions whose docstrings are the descriptions the model reads; pandas because the model reaches for it every time and gets CSVs right (my csv-module fallback miscounted the header row). | RAG, a vector store or SQLite: the workspace is small, `read_file`/`search_files`/`run_python` answer everything, and an index is more setup, more dependencies and one more thing that can be stale. |
@@ -136,6 +137,10 @@ What each module does, in reading order:
 - `cli.py`: the REPL, `serve`, and the `models` subcommands. Each turn runs on a worker thread
   while the REPL thread renders its events, because LangGraph runs graph nodes on pool threads
   and Python delivers Ctrl-C only to the main thread; Ctrl-C sets the turn's cancel signal.
+- `terminal.py`: the REPL's terminal side. A prompt_toolkit line reader for `you>` and the Yes/No
+  approval menu (Esc cancels the turn; keys typed before the menu appeared, or within its first
+  half second, are dropped), and the start-up guess of a light or dark background (an OSC 11
+  query, else `COLORFGBG`) that picks ANSI code colours on the terminal's own background.
 - `server.py`: the HTTP API below, one `asyncio.Lock` per thread, lazy start (the server comes up
   even when Studio is down and reports the hint in `/api/health`), and the static bundle (the page
   is revalidated on every load, so a new build shows at once; the hashed scripts are cached).
@@ -201,7 +206,10 @@ this code. Tell the user it was not executed and stop; do not retry."}`. The mid
 sentence as an error `ToolMessage` in place of a result (no code runs), the model reads it and
 answers along the lines of "The code was not executed as the user declined to run it", the CLI
 prints "not executed; the model is told the code did not run", and the web card turns to `denied`.
-A bare reject without the message produced a confused answer, hence the wording. In the CLI, EOF,
-Ctrl-C at the question and anything other than `y`/`yes` count as a denial. The server validates a
-resume before it touches the graph (right thread, right `interrupt_id`, one allowed decision per
-request), because a malformed resume would poison the thread.
+A bare reject without the message produced a confused answer, hence the wording. In a terminal the
+CLI asks with a menu whose Esc (or Ctrl-C) is a cancel, not a denial: no decision is sent, the
+model is not called again, and the call gets an error result saying the user cancelled, so the
+next message starts from a consistent thread. With piped input, EOF, Ctrl-C at the question and
+anything other than `y`/`yes` count as a denial. The server validates a resume before it touches
+the graph (right thread, right `interrupt_id`, one allowed decision per request), because a
+malformed resume would poison the thread.

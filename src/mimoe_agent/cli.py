@@ -3,11 +3,18 @@
 The REPL drives :func:`mimoe_agent.stream.iter_events` and renders the event stream with rich: a
 spinner while the model works, tool calls as dim ``-> name(args)`` lines, tool results dim and
 shortened (``/verbose`` shows everything), the answer as live-rendered Markdown, notices in
-yellow and a closing ``elapsed 6.3 s, 2 model calls, 91 tokens`` line. A ``run_python`` request
-ends the stream (``done{status: "awaiting_approval"}``): the code is shown with line numbers,
-flagged in red when it touches the network, processes or files, and the answer to
-``Run this code? [y/N]`` becomes exactly one decision per action request in the
-``Command(resume=...)`` that continues the graph.
+yellow and a closing ``elapsed 6.3 s, 2 model calls, 91 tokens`` line. Code is highlighted in
+ANSI colours on the terminal's own background, light or dark as guessed at start-up
+(:mod:`mimoe_agent.terminal`). A ``run_python`` request ends the stream
+(``done{status: "awaiting_approval"}``): the code is shown with line numbers, flagged in red when
+it touches the network, processes or files, and the answer to ``Run this code?`` becomes exactly
+one decision per action request in the ``Command(resume=...)`` that continues the graph.
+
+On a terminal the ``you>`` line and the approval question are prompt_toolkit widgets: a line
+editor with history, and a Yes/No menu whose Esc cancels the turn (the code does not run and the
+model is not called again). Otherwise (a pipe, a redirected stdout, a dumb terminal) both are
+plain lines read with ``console.input``, the question as ``Run this code? [y/N]``, and lines
+from a piped stdin are echoed so the transcript reads like a session.
 
 Ctrl-C at the prompt exits with 130; Ctrl-C during a turn cancels the turn (``run_python`` kills
 its child on the way out) and keeps the REPL; EOF exits with 0, so scripted sessions work:
@@ -15,9 +22,11 @@ its child on the way out) and keeps the REPL; EOF exits with 0, so scripted sess
 preflight failures print the message and its hint and exit with 1.
 
 LangChain is imported lazily, after :func:`mimoe_agent.config.apply_tracing_env` ran, so a
-reviewer's ``LANGSMITH_TRACING=true`` never uploads a prompt unless ``--trace`` is given. The
-only signal handling is Python's own ``KeyboardInterrupt``; nothing here forks or sends signals,
-so the module behaves the same on Windows.
+reviewer's ``LANGSMITH_TRACING=true`` never uploads a prompt unless ``--trace`` is given.
+Besides Python's own ``KeyboardInterrupt``, only prompt_toolkit handles signals, while it reads a
+line or shows the menu: SIGINT arrives there as a key, SIGWINCH redraws, and on POSIX Ctrl-Z at
+the prompt suspends the process group (SIGTSTP), as the terminal's own Ctrl-Z does during a
+turn. This module itself forks nothing and sends no signal, so it behaves the same on Windows.
 """
 
 from __future__ import annotations
@@ -35,12 +44,12 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import typer
-from rich.console import Console, Group
+from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.live import Live
-from rich.markdown import Markdown
+from rich.markdown import CodeBlock, Markdown, MarkdownElement
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeElapsedColumn
 from rich.status import Status
@@ -48,7 +57,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from mimoe_agent import __version__
+from mimoe_agent import __version__, terminal
 from mimoe_agent.agent import APPROVAL_TOOL, APPROVAL_WARNING
 from mimoe_agent.config import ConfigError, Settings, apply_tracing_env, env_name, load_settings
 from mimoe_agent.mimoe import (
@@ -89,6 +98,17 @@ REJECT_MESSAGE = (
     "The user declined to run this code. Tell the user it was not executed and stop; do not retry."
 )
 CANCELLED_RESULT = "ERROR: cancelled by the user before the tool finished"
+APPROVAL_QUESTION = "Run this code?"
+APPROVAL_CANCELLED = "cancelled: the code did not run and the turn ended"
+"""What the REPL prints after Esc (or Ctrl-C) in the approval menu."""
+APPROVAL_CANCELLED_STEP = "cancelled: none of the {count} requests ran and the turn ended"
+"""The same when the step asked for several approvals: a cancel at any of them stops the whole
+step, including requests already approved above it."""
+APPROVAL_CANCELLED_RESULT = (
+    "ERROR: the user cancelled the turn at the approval prompt; the code was not executed"
+)
+"""The result a cancelled approval leaves for the ``run_python`` calls of its step, so the next
+request carries no tool call without a result."""
 # Characters a terminal would act on instead of showing (C0/C1 controls such as ESC, which
 # starts cursor-movement, colour, title and clipboard sequences), plus bidirectional overrides
 # and line separators that reorder or hide text. Everything the model or a tool produced is
@@ -448,12 +468,14 @@ def run_repl(overrides: Mapping[str, object]) -> int:
     apply_tracing_env(settings)
     client = MimoeClient(settings.base_url, settings.api_key)
     try:
+        # before the spinner draws: the answer to the background query arrives on stdin
+        code_theme = terminal.code_theme(terminal.light_background())
         with console.status(
             Text("connecting to mimOE Studio", style="dim"), spinner=SPINNER
         ) as status:
             pre = preflight(settings, client=client, on_status=status.update)
             status.update(Text("building the agent", style="dim"))
-            session = Session(settings, client, pre, console)
+            session = Session(settings, client, pre, console, code_theme=code_theme)
             session.build_agent()
     except MimoeError as exc:
         print_failure(_stderr_console(), exc.message, exc.hint)
@@ -495,6 +517,29 @@ class TurnStats:
         return line
 
 
+class _CodeBlock(CodeBlock):
+    """A code block of an answer: highlighted on the terminal's own background, without the
+    padding rich puts around it. Without a background band of its own, that padding only added
+    a blank row above and below the code and indented every line by a column, which a copy of
+    the code carried along."""
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        code = str(self.text).rstrip()
+        yield Syntax(
+            code, self.lexer_name, theme=self.theme, background_color="default", word_wrap=True
+        )
+
+
+class _Markdown(Markdown):
+    """rich's Markdown with :class:`_CodeBlock` for fenced and indented code."""
+
+    elements: ClassVar[dict[str, type[MarkdownElement]]] = {
+        **Markdown.elements,
+        "fence": _CodeBlock,
+        "code_block": _CodeBlock,
+    }
+
+
 class Renderer:
     """Render one ``iter_events`` segment (a turn, or the part after a resume) to the console.
 
@@ -504,12 +549,20 @@ class Renderer:
     """
 
     def __init__(
-        self, console: Console, stats: TurnStats, *, verbose: bool, show_thinking: bool
+        self,
+        console: Console,
+        stats: TurnStats,
+        *,
+        verbose: bool,
+        show_thinking: bool,
+        code_theme: str = terminal.DARK_CODE_THEME,
     ) -> None:
         self.console = console
         self.stats = stats
         self.verbose = verbose
         self.show_thinking = show_thinking
+        self.code_theme = code_theme
+        """rich syntax theme of the code blocks in the answer (``terminal.code_theme``)."""
         self.status = "completed"
         """``completed``, ``awaiting_approval`` or ``error`` once the segment ended."""
         self.approval: dict[str, Any] | None = None
@@ -604,7 +657,7 @@ class Renderer:
             return  # a pipe or a dumb terminal gets the answer rendered once, at the end
         if self._live is None:
             self._live = Live(
-                Markdown(""),
+                self._markdown(""),
                 console=self.console,
                 refresh_per_second=REFRESH_PER_SECOND,
                 redirect_stdout=False,
@@ -617,7 +670,10 @@ class Renderer:
         now = time.monotonic()
         if now - self._rendered_at >= 1 / REFRESH_PER_SECOND:
             self._rendered_at = now
-            self._live.update(Markdown(self._answer))
+            self._live.update(self._markdown(self._answer))
+
+    def _markdown(self, text: str) -> Markdown:
+        return _Markdown(text, code_theme=self.code_theme)
 
     def _end_answer(self) -> None:
         if not self._answer:
@@ -625,10 +681,10 @@ class Renderer:
         answer, self._answer = self._answer, ""
         self.stats.visible_chars += len(answer)
         if self._live is None:
-            self.console.print(Markdown(answer))
+            self.console.print(self._markdown(answer))
             return
         live, self._live = self._live, None
-        live.update(Markdown(answer))
+        live.update(self._markdown(answer))
         live.stop()
 
     def _thought(self, text: str) -> None:
@@ -688,6 +744,11 @@ class Session:
     thread_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     agent: Any = None
     checkpointer: Any = None
+    code_theme: str = terminal.DARK_CODE_THEME
+    """rich syntax theme for the approval code and the answers' code blocks."""
+    reader: terminal.LineReader | None = None
+    """The prompt_toolkit line reader on a terminal (``loop`` opens it). Without one, lines and
+    approval answers are read with ``console.input``."""
     _pending: threading.Thread | None = None
     """A cancelled turn's worker that was still winding down when the prompt came back."""
     _repair_after_pending: bool = False
@@ -732,11 +793,14 @@ class Session:
 
     def loop(self) -> int:
         """Read prompts until ``/quit``, EOF (0) or Ctrl-C at the prompt (130)."""
+        if self.reader is None and terminal.interactive():
+            self.reader = terminal.LineReader.open(PROMPT)
         while True:
             try:
-                line = read_line(self.console)
+                line = self.read_line()
             except KeyboardInterrupt:
-                self.console.print()
+                if self.reader is None:  # the line reader ends its line itself
+                    self.console.print()
                 return EXIT_INTERRUPT
             if line is None:
                 return EXIT_OK
@@ -756,6 +820,18 @@ class Session:
                     self.console.print(Text("command interrupted", style="yellow"))
                 else:
                     self.cancel_turn()
+
+    def read_line(self) -> str | None:
+        """One REPL line (``None`` on EOF): from the line reader when there is one, else from
+        :func:`read_plain_line`. A reader that fails is dropped for the rest of the session."""
+        if self.reader is not None:
+            try:
+                return self.reader.read()
+            except EOFError:
+                return None
+            except Exception:  # prompt_toolkit cannot drive this terminal after all
+                self.reader = None
+        return read_plain_line(self.console)
 
     def handle_command(self, line: str) -> bool:
         """Run a slash command; ``False`` means quit."""
@@ -803,6 +879,12 @@ class Session:
                 break
             attempt += 1
             decisions = self.ask_decisions(renderer.approval, attempt)
+            if decisions is None:
+                # Cancelled: no decision is sent and the model is not called again. A new
+                # message would drop the interrupt and send the model the calls without results,
+                # so they get theirs now.
+                self._repair_thread(at_approval=True)
+                break
             if not self.pending_interrupt():
                 self.console.print(
                     Text("nothing is waiting for a decision; the turn ended", style="yellow")
@@ -827,7 +909,11 @@ class Session:
 
         self._settle_pending()
         renderer = Renderer(
-            self.console, stats, verbose=self.verbose, show_thinking=self.settings.think
+            self.console,
+            stats,
+            verbose=self.verbose,
+            show_thinking=self.settings.think,
+            code_theme=self.code_theme,
         )
         cancel = threading.Event()
         config = self.turn_config(cancel)
@@ -915,8 +1001,14 @@ class Session:
         elif repair:
             self._repair_thread()
 
-    def ask_decisions(self, approval: Mapping[str, Any], attempt: int) -> list[dict[str, str]]:
-        """Show every action request and collect one approve/reject decision per request."""
+    def ask_decisions(
+        self, approval: Mapping[str, Any], attempt: int
+    ) -> list[dict[str, str]] | None:
+        """Show every action request and collect one approve/reject decision per request.
+
+        Returns ``None`` when the user cancelled (Esc or Ctrl-C in the menu): that ends the whole
+        step, so the requests after it are not shown and no decision is sent.
+        """
         requests = [r for r in approval.get("action_requests") or [] if isinstance(r, Mapping)]
         configs = [c for c in approval.get("review_configs") or [] if isinstance(c, Mapping)]
         decisions: list[dict[str, str]] = []
@@ -932,7 +1024,16 @@ class Session:
             else:
                 code, lexer = json.dumps(args, indent=2, ensure_ascii=False), "json"
             shown, hidden = terminal_safe(code, strict=True)
-            self.console.print(Syntax(shown, lexer, line_numbers=True, word_wrap=True))
+            self.console.print(
+                Syntax(
+                    shown,
+                    lexer,
+                    theme=self.code_theme,
+                    background_color="default",
+                    line_numbers=True,
+                    word_wrap=True,
+                )
+            )
             if hidden:
                 self.console.print(
                     Text(
@@ -953,8 +1054,16 @@ class Session:
                 )
             self.console.print(Text(APPROVAL_WARNING, style="yellow"))
             allowed = _allowed_decisions(configs, index, name)
-            answer = self._ask("Run this code? [y/N] ")
-            if answer in ("y", "yes") and "approve" in allowed:
+            choice = self._choose()
+            if choice == terminal.CANCEL:
+                cancelled = (
+                    APPROVAL_CANCELLED_STEP.format(count=len(requests))
+                    if len(requests) > 1
+                    else APPROVAL_CANCELLED
+                )
+                self.console.print(Text(cancelled, style="yellow"))
+                return None
+            if choice == terminal.YES and "approve" in allowed:
                 decisions.append({"type": "approve"})
                 self.console.print(Text("approved", style="green"))
             else:
@@ -964,16 +1073,24 @@ class Session:
                 )
         return decisions
 
-    def _ask(self, prompt: str) -> str:
-        """One line from stdin, lower-cased; EOF, Ctrl-C or a closed stdin count as a denial."""
+    def _choose(self) -> str:
+        """YES, NO or CANCEL: the menu on a terminal, else a ``[y/N]`` line where anything but
+        y/yes (EOF and Ctrl-C included) is NO."""
+        if self.reader is not None:
+            try:
+                return terminal.ask_approval(
+                    APPROVAL_QUESTION, pointer=terminal.menu_pointer(self.console)
+                )
+            except Exception:  # prompt_toolkit cannot drive this terminal after all
+                self.reader = None
         try:
-            answer = self.console.input(Text(prompt, style="bold"))
+            answer = self.console.input(Text(f"{APPROVAL_QUESTION} [y/N] ", style="bold"))
         except (EOFError, KeyboardInterrupt):
             self.console.print()
-            return ""
-        if not _stdin_is_tty():
+            return terminal.NO
+        if not terminal.isatty(sys.stdin):
             self.console.print(Text(answer))
-        return answer.strip().lower()
+        return terminal.YES if answer.strip().lower() in ("y", "yes") else terminal.NO
 
     def pending_interrupt(self) -> bool:
         """Whether the thread is stopped at an interrupt (only then may a resume be sent)."""
@@ -994,13 +1111,15 @@ class Session:
             return
         self._repair_thread()
 
-    def _repair_thread(self) -> None:
+    def _repair_thread(self, *, at_approval: bool = False) -> None:
         """Append error results for tool calls whose run was cancelled.
 
         A cancelled ``tools`` step leaves the last ``AIMessage`` with tool calls that have no
         ``ToolMessage``; the next request would send the model a dangling call. Writing the
-        results as the ``tools`` node keeps the thread consistent. Best effort: any failure here
-        only leaves the thread as the cancel left it.
+        results as the ``tools`` node keeps the thread consistent, and also clears an approval
+        interrupt the thread was waiting at. ``at_approval``: the cancel came from the approval
+        menu, before any tool of the step ran, so the ``run_python`` calls say their code was
+        not run. Best effort: any failure here only leaves the thread as the cancel left it.
         """
         from langchain_core.messages import AIMessage, ToolMessage
 
@@ -1019,16 +1138,20 @@ class Session:
             else:
                 return
             answered = {m.tool_call_id for m in messages[index + 1 :] if isinstance(m, ToolMessage)}
-            results = [
-                ToolMessage(
-                    content=CANCELLED_RESULT,
-                    tool_call_id=str(call.get("id") or ""),
-                    name=str(call.get("name") or APPROVAL_TOOL),
-                    status="error",
+            results = []
+            for call in messages[index].tool_calls:
+                name = str(call.get("name") or APPROVAL_TOOL)
+                if str(call.get("id") or "") in answered:
+                    continue
+                gated = at_approval and name == APPROVAL_TOOL
+                results.append(
+                    ToolMessage(
+                        content=APPROVAL_CANCELLED_RESULT if gated else CANCELLED_RESULT,
+                        tool_call_id=str(call.get("id") or ""),
+                        name=name,
+                        status="error",
+                    )
                 )
-                for call in messages[index].tool_calls
-                if str(call.get("id") or "") not in answered
-            ]
             if results:
                 self.agent.update_state(self.run_config, {"messages": results}, as_node="tools")
         except Exception:
@@ -1292,15 +1415,15 @@ def print_failure(console: Console, message: str, hint: str) -> None:
         console.print(Text(hint, style="yellow"))
 
 
-def read_line(console: Console) -> str | None:
-    """Read one REPL line; ``None`` on EOF. The line is echoed when stdin is not a terminal, so a
-    piped session leaves a readable transcript."""
+def read_plain_line(console: Console) -> str | None:
+    """Read one REPL line with ``console.input`` (no line reader); ``None`` on EOF. The line is
+    echoed when stdin is not a terminal, so a piped session leaves a readable transcript."""
     try:
         line = console.input(Text(PROMPT, style="bold cyan"))
     except EOFError:
         console.print()
         return None
-    if not _stdin_is_tty():
+    if not terminal.isatty(sys.stdin):
         console.print(Text(line))
     return line
 
@@ -1310,11 +1433,9 @@ def read_line(console: Console) -> str | None:
 
 def _console() -> Console:
     """A console bound to the current ``sys.stdout`` (tests swap it); no markup surprises from
-    model text because every dynamic string is printed as ``Text``."""
-    with contextlib.suppress(ImportError):
-        if _stdin_is_tty():
-            import readline  # noqa: F401  (line editing and history on POSIX terminals)
-    return Console(highlight=False, emoji=False)
+    model text because every dynamic string is printed as ``Text``, and inline code in answers
+    has no background of its own (``terminal.CONSOLE_THEME``)."""
+    return Console(highlight=False, emoji=False, theme=terminal.CONSOLE_THEME)
 
 
 def _stderr_console() -> Console:
@@ -1328,13 +1449,6 @@ def _reconfigure_streams() -> None:
         if reconfigure is not None:
             with contextlib.suppress(Exception):
                 reconfigure(encoding="utf-8", errors="replace")
-
-
-def _stdin_is_tty() -> bool:
-    try:
-        return bool(sys.stdin is not None and sys.stdin.isatty())
-    except (AttributeError, ValueError, OSError):
-        return False
 
 
 def _overrides(ctx: typer.Context) -> Mapping[str, object]:

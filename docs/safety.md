@@ -38,6 +38,12 @@ What `run_python` does to keep accidents small (none of it is a sandbox):
   for writing, and another when it contains invisible or terminal-control characters (zero-width
   and bidirectional-override characters, ESC sequences). Those are shown escaped, so code cannot
   look different on screen from what runs. Read the code anyway.
+- In a terminal the question is a menu with Yes highlighted, as in Claude Code. Keys typed before
+  it appeared are discarded, and it takes an answer only after the keyboard has been quiet for
+  half a second (a key that comes sooner starts the wait again), so an Enter pressed while the
+  code was on its way, or the next question typed across the menu's appearance, cannot approve
+  it. Esc cancels the turn. With piped input the question is a `y`/`n` line and anything but `y`
+  is a denial.
 
 The other tools:
 

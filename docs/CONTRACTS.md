@@ -11,7 +11,8 @@ change it deliberately (and update every caller) rather than drifting from it.
 - Cross-platform: `pathlib`, `sys.executable`, no shell strings, no POSIX-only APIs without a
   Windows branch. Encode subprocess I/O as UTF-8 with `errors="replace"`.
 - Network clients use `httpx` with `trust_env=False` so proxies never capture localhost.
-- Nothing in the package prints to stdout except `cli.py`; libraries raise or return.
+- Nothing in the package prints to stdout except `cli.py` and the terminal helpers it calls
+  (`terminal.py`); libraries raise or return.
 
 ## config.py
 ```python

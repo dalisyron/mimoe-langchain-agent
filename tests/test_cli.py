@@ -1,7 +1,9 @@
 """The typer CLI against :class:`conftest.FakeMimoe` through ``CliRunner``: banner, scripted REPL
 sessions (plain answers, approvals, slash commands), the ``models`` group, ``serve`` and the exit
 codes. ``MimoeClient`` and the chat model are pointed at the fake transport, so nothing here opens
-a socket, forks or sends a signal (Ctrl-C is simulated with ``KeyboardInterrupt``)."""
+a socket, forks or sends a signal (Ctrl-C is simulated with ``KeyboardInterrupt``). The terminal
+path (the prompt_toolkit line reader and approval menu) runs on a :class:`Session` with keys from
+prompt_toolkit's pipe input."""
 
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +22,15 @@ import httpx
 import pytest
 from click.testing import Result
 from conftest import FakeMimoe
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.output import DummyOutput
 from rich.console import Console
+from rich.markdown import Markdown
+from rich.syntax import Syntax
 from typer.testing import CliRunner
 
-from mimoe_agent import cli, llm
+from mimoe_agent import cli, llm, terminal
 from mimoe_agent.agent import APPROVAL_WARNING
 from mimoe_agent.cli import CANCELLED_RESULT, NO_ANSWER, REJECT_MESSAGE, Session, app
 from mimoe_agent.config import load_settings
@@ -216,18 +223,18 @@ def test_tool_round_trip_is_rendered_and_truncated(run: Run, fake_mimoe: FakeMim
 
 def test_a_failed_tool_call_is_one_line_until_verbose(run: Run, fake_mimoe: FakeMimoe) -> None:
     """The error is for the model, which reads it and adjusts; the reader gets one plain line."""
-    code = {"tool_calls": [{"name": "calculator", "args": {"expression": "sum(range(10))"}}]}
+    # input() is no calculation: the calculator refuses it, however much else it accepts
+    code = {"tool_calls": [{"name": "calculator", "args": {"expression": "input()"}}]}
     script(fake_mimoe, code, {"content": "Counted."}, code, {"content": "Again."})
     result = run(input="count\n/verbose\ncount\n/quit\n")
     assert result.exit_code == 0
     first, second = result.output.split("verbose on")
-    assert "-> calculator(expression='sum(range(10))')" in first
+    assert "-> calculator(expression='input()')" in first
     assert f"   {cli.FAILED_LINE}" in first and "Counted." in first
-    assert "unknown function 'range'" not in first
-    assert "ERROR: unknown function 'range'" in second and cli.FAILED_LINE not in second
-    assert (
-        "call run_python" in _tool_messages(fake_mimoe)[-1]["content"]
-    )  # the model still reads why
+    error = _tool_messages(fake_mimoe)[-1]["content"]
+    assert error.startswith("ERROR: ") and "call run_python" in error  # the model still reads why
+    assert error[:30] not in first
+    assert error[:30] in second and cli.FAILED_LINE not in second
 
 
 def test_empty_answer_message(run: Run, fake_mimoe: FakeMimoe) -> None:
@@ -1024,14 +1031,14 @@ def test_long_answer_streams_throttled_and_prints_in_full_on_a_terminal(
     """On a terminal the answer streams through rich Live (cropped to the screen while it grows)
     and is printed whole at the end; the Markdown re-parse is throttled to the refresh rate."""
     parses = {"n": 0}
-    real_markdown = cli.Markdown
+    real_markdown = cli._Markdown
 
     class CountingMarkdown(real_markdown):  # type: ignore[misc,valid-type]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             parses["n"] += 1
             super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(cli, "Markdown", CountingMarkdown)
+    monkeypatch.setattr(cli, "_Markdown", CountingMarkdown)
     buf = io.StringIO()
     console = Console(
         file=buf, force_terminal=True, force_interactive=True, width=100, height=24, emoji=False
@@ -1043,7 +1050,7 @@ def test_long_answer_streams_throttled_and_prints_in_full_on_a_terminal(
     out = buf.getvalue()
     assert "Line 0 of a very long answer." in out and "Line 399 of a very long answer." in out
     assert "elapsed" in out
-    assert parses["n"] <= 20, parses  # not once per streamed chunk
+    assert 1 <= parses["n"] <= 20, parses  # not once per streamed chunk
 
 
 def test_blank_input_lines_are_ignored(run: Run, fake_mimoe: FakeMimoe) -> None:
@@ -1102,3 +1109,332 @@ def test_auto_approve_with_allow_network_warns(run: Run, fake_mimoe: FakeMimoe) 
     assert f"! {cli.UNATTENDED_NETWORK_WARNING}" in result.output
     alone = run("--auto-approve", input="/quit\n")
     assert cli.UNATTENDED_NETWORK_WARNING not in alone.output
+
+
+# -- the terminal: line reader, approval menu, code colours --------------------------------------
+
+
+@pytest.fixture
+def menu_input(monkeypatch: pytest.MonkeyPatch) -> Iterator[PipeInput]:
+    """The terminal as prompt_toolkit sees it: keys from a pipe, nothing drawn. The line reader
+    and the approval menu run for real on it; the menu takes keys sent ahead of it at once (its
+    timing rules are tested in test_terminal.py)."""
+    monkeypatch.setattr(terminal, "ARM_DELAY_S", 0)
+    monkeypatch.setattr(terminal, "SETTLE_S", 0)
+    with create_pipe_input() as pipe, create_app_session(pipe, DummyOutput()):
+        yield pipe
+
+
+def _terminal_session(
+    fake_mimoe: FakeMimoe, workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Session, io.StringIO]:
+    """A session that reads lines and approvals the terminal way (``menu_input`` must be on)."""
+    buf = io.StringIO()
+    session = _session(fake_mimoe, workspace_tmp, monkeypatch, Console(file=buf, width=120))
+    session.reader = terminal.LineReader(cli.PROMPT)
+    return session, buf
+
+
+@pytest.mark.parametrize(("keys", "approved"), [("\r", True), ("\x1b[B\r", False), ("2", False)])
+def test_the_approval_menu_answers_for_the_session(
+    fake_mimoe: FakeMimoe,
+    workspace_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    menu_input: PipeInput,
+    keys: str,
+    approved: bool,
+) -> None:
+    session, buf = _terminal_session(fake_mimoe, workspace_tmp, monkeypatch)
+    fake_mimoe.script(RUN_PYTHON, {"content": "Done."})
+    menu_input.send_text(keys)
+    session.run_turn("Use run_python to print 6*7")
+    out = buf.getvalue()
+    assert "approval request 1/1: run_python" in out and APPROVAL_WARNING in out
+    assert "Run this code? [y/N]" not in out  # the menu asked, not the line
+    tool = _tool_messages(fake_mimoe)[0]["content"]
+    if approved:
+        assert "approved" in out and "stdout:\n42" in tool
+    else:
+        assert "not executed; the model is told the code did not run" in out
+        assert REJECT_MESSAGE in tool and "stdout" not in tool
+    assert "Done." in out and "2 model calls" in out
+
+
+def test_esc_in_the_approval_menu_cancels_the_turn(
+    fake_mimoe: FakeMimoe,
+    workspace_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    menu_input: PipeInput,
+) -> None:
+    """Esc ends the turn like Ctrl-C: no decision is sent, the model is not called again, and
+    the call gets a result saying the code did not run, so the next message goes out whole."""
+    from langchain_core.messages import ToolMessage
+
+    session, buf = _terminal_session(fake_mimoe, workspace_tmp, monkeypatch)
+    fake_mimoe.script(RUN_PYTHON)
+    menu_input.send_text("\x1b")
+    before = len(fake_mimoe.calls)
+    session.run_turn("Use run_python to print 6*7")
+    out = buf.getvalue()
+    assert cli.APPROVAL_CANCELLED in out
+    assert "approved" not in out and "not executed" not in out and "elapsed" not in out
+    assert len(fake_mimoe.calls) == before + 1  # only the call that asked for run_python
+    assert not session.pending_interrupt()
+    last = session.agent.get_state(session.run_config).values["messages"][-1]
+    assert isinstance(last, ToolMessage) and last.status == "error"
+    assert last.content == cli.APPROVAL_CANCELLED_RESULT and last.tool_call_id == "tool_0"
+
+    fake_mimoe.script({"content": "OK, it did not run."})
+    session.run_turn("hi")
+    sent = fake_mimoe.calls[-1]["messages"]
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool", "user"]
+    assert cli.APPROVAL_CANCELLED_RESULT in sent[3]["content"]
+    assert "OK, it did not run." in buf.getvalue()
+
+
+def test_a_new_message_at_an_approval_interrupt_would_leave_the_call_dangling(
+    fake_mimoe: FakeMimoe, workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Why a cancel mends the thread: LangGraph takes a new message on a thread that waits at the
+    approval interrupt as a fresh run, drops the interrupt without a word and sends the model
+    the tool call with no result after it."""
+    from langchain_core.messages import HumanMessage
+
+    from mimoe_agent import stream
+
+    session = _session(fake_mimoe, workspace_tmp, monkeypatch, Console(file=io.StringIO()))
+    fake_mimoe.script(RUN_PYTHON, {"content": "fresh"})
+    go = {"messages": [HumanMessage("go")]}
+    assert list(stream.iter_events(session.agent, go, session.run_config))[-1]["status"] == (
+        "awaiting_approval"
+    )
+    assert session.pending_interrupt()
+    hello = {"messages": [HumanMessage("hello")]}
+    list(stream.iter_events(session.agent, hello, session.run_config))
+    assert not session.pending_interrupt()
+    sent = fake_mimoe.calls[-1]["messages"]
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"]
+    assert sent[2]["tool_calls"][0]["function"]["name"] == "run_python"
+
+
+def test_a_cancel_at_the_second_request_cancels_the_whole_step(
+    fake_mimoe: FakeMimoe,
+    workspace_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    menu_input: PipeInput,
+) -> None:
+    """Yes to the first request, Esc at the second: nothing of the step runs, not even the
+    approved snippet or the tool that needed no approval, and every call gets a result."""
+    from langchain_core.messages import ToolMessage
+
+    session, buf = _terminal_session(fake_mimoe, workspace_tmp, monkeypatch)
+    answers = iter([terminal.YES, terminal.CANCEL])
+    monkeypatch.setattr(terminal, "ask_approval", lambda question, pointer: next(answers))
+    fake_mimoe.script(
+        {
+            "tool_calls": [
+                {"name": "list_files", "args": {"path": "."}},
+                {"name": "run_python", "args": {"code": "print(1)"}},
+                {"name": "run_python", "args": {"code": "print(2)"}},
+            ]
+        }
+    )
+    before = len(fake_mimoe.calls)
+    session.run_turn("both")
+    out = buf.getvalue()
+    assert "approval request 2/2" in out and "approved" in out
+    # the "approved" above it did not run either, and the last line says so
+    assert out.rstrip().endswith("cancelled: none of the 2 requests ran and the turn ended")
+    assert cli.APPROVAL_CANCELLED not in out
+    assert len(fake_mimoe.calls) == before + 1
+    assert not session.pending_interrupt()
+    messages = session.agent.get_state(session.run_config).values["messages"]
+    results = {m.tool_call_id: m.content for m in messages if isinstance(m, ToolMessage)}
+    assert results == {
+        "tool_0": CANCELLED_RESULT,
+        "tool_1": cli.APPROVAL_CANCELLED_RESULT,
+        "tool_2": cli.APPROVAL_CANCELLED_RESULT,
+    }
+
+
+def test_the_repl_reads_with_the_line_reader_on_a_terminal(
+    fake_mimoe: FakeMimoe,
+    workspace_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    menu_input: PipeInput,
+) -> None:
+    monkeypatch.setattr(terminal, "interactive", lambda: True)
+    buf = io.StringIO()
+    session = _session(fake_mimoe, workspace_tmp, monkeypatch, Console(file=buf, width=120))
+    fake_mimoe.script({"content": "Hello."})
+    menu_input.send_text("hi\r\x04")  # a line, then Ctrl-D on the empty prompt
+    assert session.loop() == cli.EXIT_OK
+    assert isinstance(session.reader, terminal.LineReader)
+    assert "Hello." in buf.getvalue() and cli.PROMPT not in buf.getvalue()  # prompt_toolkit's
+    assert fake_mimoe.calls[-1]["messages"][-1]["content"] == "hi /no_think"
+    menu_input.send_text("typed\x03")  # Ctrl-C at the prompt
+    assert session.loop() == cli.EXIT_INTERRUPT
+    assert buf.getvalue().endswith("tokens\n")  # prompt_toolkit ended the line already
+
+
+def test_plain_lines_when_prompt_toolkit_cannot_drive_the_terminal(
+    fake_mimoe: FakeMimoe, workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No line reader (mintty without winpty, say): the you> line and the y/N question are read
+    with ``console.input`` as on a pipe."""
+    monkeypatch.setattr(terminal, "interactive", lambda: True)
+    monkeypatch.setattr(terminal.LineReader, "open", classmethod(lambda cls, prompt: None))
+    lines = iter(["Use run_python to print 6*7", "y", "/quit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
+    buf = io.StringIO()
+    session = _session(fake_mimoe, workspace_tmp, monkeypatch, Console(file=buf, width=120))
+    fake_mimoe.script(RUN_PYTHON, {"content": "42."})
+    assert session.loop() == cli.EXIT_OK
+    assert session.reader is None
+    assert "Run this code? [y/N] y" in buf.getvalue() and "approved" in buf.getvalue()
+
+
+def test_a_line_reader_or_menu_that_fails_later_falls_back_to_plain_lines(
+    fake_mimoe: FakeMimoe, workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class GoneConsole:
+        def read(self) -> str:
+            raise OSError("the console went away")
+
+    def broken_menu(question: str, pointer: str) -> str:
+        raise RuntimeError("no console screen buffer")
+
+    buf = io.StringIO()
+    session = _session(fake_mimoe, workspace_tmp, monkeypatch, Console(file=buf, width=120))
+    lines = iter(["/quit", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
+    session.reader = GoneConsole()  # type: ignore[assignment]
+    assert session.loop() == cli.EXIT_OK and session.reader is None
+
+    session.reader = GoneConsole()  # type: ignore[assignment]
+    monkeypatch.setattr(terminal, "ask_approval", broken_menu)
+    fake_mimoe.script(RUN_PYTHON, {"content": "42."})
+    session.run_turn("Use run_python to print 6*7")
+    assert "Run this code? [y/N] y" in buf.getvalue() and "approved" in buf.getvalue()
+    assert session.reader is None
+
+
+SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def _backgrounds(ansi: str) -> set[str]:
+    """Background colours the SGR sequences in ``ansi`` set (49, the default, left out)."""
+    found: set[str] = set()
+    for params in SGR_RE.findall(ansi):
+        codes = params.split(";")
+        index = 0
+        while index < len(codes):
+            code = codes[index]
+            if code in ("38", "48"):  # extended colour: 5;n or 2;r;g;b
+                width = 3 if codes[index + 1 : index + 2] == ["5"] else 5
+                if code == "48":
+                    found.add(";".join(codes[index : index + width]))
+                index += width
+                continue
+            if code.isdigit() and (40 <= int(code) <= 47 or 100 <= int(code) <= 107):
+                found.add(code)
+            index += 1
+    return found
+
+
+@pytest.mark.parametrize("light", [True, False])
+def test_code_is_drawn_on_the_terminals_own_background(
+    fake_mimoe: FakeMimoe, workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch, light: bool
+) -> None:
+    """The approval code, a code block and inline code in an answer: palette colours on the
+    terminal's background, where rich's defaults paint monokai's #272822 and black."""
+    monkeypatch.delenv("NO_COLOR", raising=False)  # rich would draw no colour at all
+    code = "def double(x):\n    return x * 2  # twice\n\nprint(double(21))\n"
+
+    def console(buf: io.StringIO, **kwargs: Any) -> Console:
+        return Console(file=buf, force_terminal=True, color_system="truecolor", width=100, **kwargs)
+
+    buf = io.StringIO()
+    themed = console(buf, theme=terminal.CONSOLE_THEME)  # what cli._console() adds
+    session = _session(fake_mimoe, workspace_tmp, monkeypatch, themed)
+    session.code_theme = terminal.code_theme(light)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    request = {"name": "run_python", "args": {"code": code}}
+    assert session.ask_decisions({"action_requests": [request]}, 1) == [
+        {"type": "reject", "message": REJECT_MESSAGE}
+    ]
+    renderer = cli.Renderer(
+        session.console,
+        cli.TurnStats(),
+        verbose=False,
+        show_thinking=False,
+        code_theme=session.code_theme,
+    )
+    renderer.handle({"event": "token", "text": f"Run `double(21)`:\n\n```python\n{code}```\n"})
+    renderer.close()
+    out = buf.getvalue()
+    assert "double" in out and "\x1b[" in out
+    assert _backgrounds(out) == set()
+    assert "38;2;" not in out and "38;5;" not in out  # the 16 palette colours only
+
+    reference = io.StringIO()
+    rich_defaults = console(reference)
+    rich_defaults.print(Syntax(code, "python", line_numbers=True))
+    rich_defaults.print(Markdown("Run `double(21)`"))
+    assert _backgrounds(reference.getvalue()) >= {"48;2;39;40;34", "40"}
+
+
+def test_code_blocks_in_answers_sit_like_paragraphs(
+    fake_mimoe: FakeMimoe, workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a background band, rich's padding around a code block only left two blank rows
+    above and below it and indented each line, and a copy of the code kept the indent."""
+    buf = io.StringIO()
+    session = _session(fake_mimoe, workspace_tmp, monkeypatch, Console(file=buf, width=60))
+    fake_mimoe.script(
+        {"content": "Here:\n\n```python\nfor n in range(3):\n    print(n)\n```\n\nDone."}
+    )
+    session.run_turn("show me")
+    lines = [line.rstrip() for line in buf.getvalue().splitlines()]
+    start = lines.index("Here:")
+    assert lines[start : start + 6] == [
+        "Here:",
+        "",
+        "for n in range(3):",
+        "    print(n)",
+        "",
+        "Done.",
+    ]
+
+
+def test_the_code_theme_is_picked_once_at_start_up(
+    run: Run, fake_mimoe: FakeMimoe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    guesses: list[bool] = []
+    monkeypatch.setattr(terminal, "light_background", lambda: guesses.append(True) or True)
+    themes: list[str | None] = []
+    real_markdown = cli._Markdown
+
+    class RecordingMarkdown(real_markdown):  # type: ignore[misc,valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            themes.append(kwargs.get("code_theme"))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_Markdown", RecordingMarkdown)
+    script(fake_mimoe, {"content": "one"}, {"content": "two"})
+    result = run(input="a\nb\n/quit\n")
+    assert result.exit_code == 0, result.output
+    assert guesses == [True]
+    assert themes and set(themes) == {"ansi_light"}
+
+
+def test_no_terminal_query_and_no_menu_without_a_terminal(
+    run: Run, fake_mimoe: FakeMimoe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("COLORFGBG", raising=False)
+    script(fake_mimoe, RUN_PYTHON, {"content": "Not run."})
+    result = run(input="go\nn\n/quit\n")
+    assert result.exit_code == 0, result.output
+    assert "\x1b]11;?" not in result.output and "\x1b[c" not in result.output
+    assert "Run this code? [y/N] n" in result.output and "Esc to cancel" not in result.output
+    assert cli._console().get_style("markdown.code").bgcolor is None

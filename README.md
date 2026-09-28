@@ -98,7 +98,7 @@ wording will differ, the facts should not.
 |---|---|---|---|
 | 1 | `What files are in this workspace?` | `list_files` | "The files in the workspace are: README.md, notes.md, sales.csv, src/app.py, src/utils.py", each with its size. Five files, matching `ls -R workspace`. |
 | 2 | `Summarize notes.md` | `read_file` | A short list: the CSV export shipped in week 38, a regression test is needed before the next release, the customer call went well and they want the dashboard by October, two ideas about caching the report and nightly versus on-demand runs. |
-| 3 | `Use run_python to count the data rows of sales.csv and sum its revenue column.` | `run_python`, after your approval | The pandas code with line numbers, then `Run this code? [y/N]`. After `y`: "The sales.csv file has 8 data rows, and the sum of the revenue column is 1836.6." Check: `sales.csv` has 8 data rows below the header and the revenue column sums to 1836.6. After `n`: "The code was not executed as the user declined to run it." and the model stops. |
+| 3 | `Use run_python to count the data rows of sales.csv and sum its revenue column.` | `run_python`, after your approval | The pandas code with line numbers, then the menu `Run this code?` with `1. Yes` and `2. No` (Esc cancels the turn). After Yes: "The sales.csv file has 8 data rows, and the sum of the revenue column is 1836.6." Check: `sales.csv` has 8 data rows below the header and the revenue column sums to 1836.6. After No: "The code was not executed as the user declined to run it." and the model stops. |
 | 4 | `Find every TODO in this workspace and tell me where they are.` | `search_files` | "notes.md (line 5): TODO: add a regression test ...; notes.md (line 10): TODO: decide whether the report runs nightly or on demand" (plus README.md line 8, which is this prompt). The workspace has a third TODO in `src/app.py` line 25; in my runs the model searched `*.md` only and missed it, so if yours does too, ask it to search `*.py` as well. |
 | 5 | `What model am I talking to, and how fast is it?` | `mimoe_status` | "You are talking to the "qwen3-4b" model, which has 4.0B parameters. It processes 31.8 tokens per second on average." Your model id and number will differ; they come from `GET /models`. |
 
@@ -125,6 +125,7 @@ uv run mimoe-agent models unload qwen3-8b
 - **Model client:** `ChatOpenAI` from langchain-openai, with a few adjustments for mimOE
 - **Approval:** LangChain's built-in `HumanInTheLoopMiddleware` on `run_python`
 - **Tools:** plain Python functions made into LangChain tools, with pandas available to `run_python`
+- **Terminal:** typer and rich, with prompt_toolkit for the `you>` line and the approval menu
 - **Web API:** FastAPI with Server-Sent Events (`sse-starlette`)
 - **Web UI:** React, Vite and TypeScript with Tailwind CSS and shadcn/ui-style components (Radix
   menus, lucide icons), built into the committed `web/dist`
@@ -146,7 +147,8 @@ done, and `--allow-network` makes it easy. The REPL's banner warns when you comb
   of your other variables) and kills it after 30 s, or once it uses more than 2 GB of memory or
   prints more than 32 MB. Before you approve, the terminal and the web UI flag common risky calls
   by name (network, subprocesses, deleting or writing files) and show invisible or terminal-control
-  characters escaped.
+  characters escaped. The terminal's approval menu drops keys typed before it appeared, so a stray
+  Enter cannot approve code you have not seen.
 - The other tools never touch the network (`mimoe_status` only asks the engine). The file tools
   are jailed to the workspace and refuse credential files; `git` is read-only and runs none of the
   repository's hooks.
@@ -182,9 +184,11 @@ silent `false`. `.env.example` lists the keys.
 | Conversation history | `serve --history PATH` (`off` keeps it in memory) | `MIMOE_HISTORY` | no | `conversations.sqlite` in the per-user data folder: `~/Library/Application Support/mimoe-agent/` on macOS, `%LOCALAPPDATA%\mimoe-agent\` on Windows, `~/.local/share/mimoe-agent/` on Linux |
 
 Exit codes of the REPL: 0 after `/quit` or EOF, 1 for a configuration or preflight failure (the
-hint is on stderr), 130 for Ctrl-C at the prompt. Piped input works
+hint is on stderr), 130 for Ctrl-C at the prompt. In a terminal, an approval is a menu: arrows and
+Enter, `1`/`2` or `y`/`n` answer it, and Esc or Ctrl-C cancels the turn (the code does not run and
+the model is not asked again). Piped input works
 (`printf "What files are here?\n/quit\n" | uv run mimoe-agent --auto-approve`); without
-`--auto-approve` an approval question reads its answer from the next stdin line.
+`--auto-approve` an approval question reads `y` or `n` from the next stdin line.
 
 ## Development
 
