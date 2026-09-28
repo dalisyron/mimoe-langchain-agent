@@ -196,7 +196,7 @@ the model is not asked again). Piped input works
 
 ```bash
 uv sync                                   # dependencies plus the dev group
-uv run pytest -q                          # 748 offline tests against the fake engine, no Studio needed
+uv run pytest -q                          # 1,265 offline tests against the fake engine, no Studio needed
 MIMOE_LIVE=1 uv run pytest -m live        # 9 live tests against a running Studio (a handful of completions)
 uvx ruff check . && uvx ruff format --check .
 cd web && npm ci && npm test && npm run build   # 41 vitest tests; the build writes web/dist

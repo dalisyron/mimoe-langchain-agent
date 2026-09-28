@@ -177,7 +177,7 @@ MEMORY_LIMIT_MB = 2048        # resident memory of the whole tree (psutil); abov
 def calculate(expression: str) -> str   # its own interpreter over a whitelisted AST; no eval/exec, never compiled to bytecode
 calculator: BaseTool
 # system.py
-now: BaseTool
+now: BaseTool   # built at import: its description names the OS zone it found
 def make_git(ws: Workspace) -> BaseTool
 def make_mimoe_status(client: MimoeClient) -> BaseTool
 ```
@@ -187,7 +187,9 @@ Tool names and argument schemas (flat, all strings/ints, defaults as shown):
 `search_files(pattern: str, path: str = ".", glob: str = "*", max_results: int = 100)`,
 `calculator(expression: str)`, `now(timezone: str | None = None)`, `mimoe_status()`,
 `git(command: Literal["status","log","diff"], path: str | None = None)`.
-Docstrings are the tool descriptions the model sees: one sentence of purpose, one of constraints.
+Docstrings are the tool descriptions the model sees: one sentence of purpose, one of constraints
+(`now`'s is built at import, so it can name the user's zone). `now` answers with the user's
+local time first, then the named zone's time when that is elsewhere.
 
 ## models.py (registry helpers used by CLI/server)
 ```python

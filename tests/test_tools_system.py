@@ -13,12 +13,14 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -54,73 +56,318 @@ class _Workspace:
 
 # --- now ----------------------------------------------------------------------------------------
 
-_FIXED = datetime(2026, 9, 24, 12, 0, 0)
-_PDT = timezone(timedelta(hours=-7), "PDT")
+_INSTANT = datetime(2026, 9, 24, 19, 0, 0, tzinfo=UTC)  # noon in Vancouver, Friday 04:00 in Tokyo
+_VANCOUVER = ZoneInfo("America/Vancouver")
+_WINDOWS = ("Pacific Standard Time", "Pacific Daylight Time")  # what Windows calls that zone
+_LOCAL = "User's local time (America/Vancouver): Thursday 2026-09-24 12:00:00 PDT (UTC-07:00)"
 
 
-def _fixed_clock(zone: tzinfo | None) -> datetime:
-    return _FIXED.replace(tzinfo=zone or _PDT)
+def _freeze(
+    monkeypatch: pytest.MonkeyPatch,
+    instant: datetime,
+    rules: tzinfo = _VANCOUVER,
+    name: str | None = "America/Vancouver",
+    names: tuple[str, str] = ("PST", "PDT"),
+) -> None:
+    """Stop the clock at ``instant`` on an OS whose zone follows ``rules``, calls its standard and
+    daylight time ``names`` (``time.tzname``) and has ``name`` as the detected IANA zone. The OS
+    shows a moment as ``datetime.astimezone()`` does: a fixed offset named by the abbreviation."""
+
+    def os_clock(moment: datetime) -> datetime:
+        at = moment.astimezone(rules)
+        return at.astimezone(timezone(at.utcoffset() or timedelta(0), names[bool(at.dst())]))
+
+    monkeypatch.setattr(system, "_os_clock", os_clock)
+    monkeypatch.setattr(system, "_current_time", lambda: os_clock(instant))
+    monkeypatch.setattr(system, "_local_zone_name", lambda: name)
+    monkeypatch.setattr(time, "tzname", names)
 
 
 @pytest.fixture
 def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(system, "_current_time", _fixed_clock)
+    """A Mac in Vancouver at noon on Thursday 2026-09-24."""
+    _freeze(monkeypatch, _INSTANT)
 
 
-def test_now_fixed_zone(frozen_clock: None) -> None:
-    assert format_now("Asia/Tokyo") == "Thursday 2026-09-24 12:00:00 JST (UTC+09:00), in Asia/Tokyo"
-    assert format_now("UTC") == "Thursday 2026-09-24 12:00:00 UTC (UTC+00:00), in UTC"
+def test_now_local_time_comes_first(frozen_clock: None) -> None:
+    assert format_now("Asia/Tokyo") == (
+        f"{_LOCAL}\nIn Asia/Tokyo: Friday 2026-09-25 04:00:00 JST (UTC+09:00)"
+    )
+    assert format_now("UTC") == f"{_LOCAL}\nIn UTC: Thursday 2026-09-24 19:00:00 UTC (UTC+00:00)"
 
 
-def test_now_local_default(frozen_clock: None) -> None:
-    assert format_now(None) == "Thursday 2026-09-24 12:00:00 PDT (UTC-07:00), local time"
-    assert format_now("") == format_now("local") == format_now(None)
+def test_now_what_day_is_it_whatever_zone_the_model_guesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reported case: qwen3-4b called now(timezone='America/New_York') for "What day is it?"
+    on a Mac in Vancouver. At 23:30 there it is Monday in New York already; the user's Sunday
+    comes first."""
+    _freeze(monkeypatch, datetime(2026, 9, 28, 6, 30, tzinfo=UTC))
+    assert format_now("America/New_York").splitlines() == [
+        "User's local time (America/Vancouver): Sunday 2026-09-27 23:30:00 PDT (UTC-07:00)",
+        "In America/New_York: Monday 2026-09-28 02:30:00 EDT (UTC-04:00)",
+    ]
 
 
 @pytest.mark.parametrize(
-    ("key", "fragment"),
+    "key",
     [
-        ("utc", "in UTC"),  # case-insensitive on every platform, not only case-insensitive disks
-        ("europe/berlin", "CEST (UTC+02:00), in Europe/Berlin"),
-        ("America/New York", "in America/New_York"),
-        ("UTC+2", "(UTC+02:00), in UTC+02:00"),
-        ("+05:30", "(UTC+05:30), in UTC+05:30"),
-        ("GMT-3", "(UTC-03:00), in UTC-03:00"),
-        ("UTC-0", "12:00:00 (UTC+00:00), in UTC+00:00"),  # a zero offset has no sign of its own
-        ("null", ", local time"),  # small models sometimes send the string "null" for "no zone"
+        None,
+        "",
+        "local",
+        "Local Time",
+        "null",  # small models send "null" too
+        "'none'",
+        "America/Vancouver",
+        "america/vancouver",
+        "Vancouver",
+        "vancouver",
+        "user's local time",  # the description's own words
+        "the user’s local time zone",
+        "Local timezone",
+        "my time zone",
+        "pdt",  # the abbreviation the clock shows now
+        "-",  # no word at all names no place
+        "…",
     ],
 )
-def test_now_tolerant_zone_spelling(frozen_clock: None, key: str, fragment: str) -> None:
-    out = format_now(key)
-    assert fragment in out, out
+def test_now_the_local_zone_is_one_line(frozen_clock: None, key: str | None) -> None:
+    assert format_now(key) == _LOCAL
 
 
-@pytest.mark.parametrize("key", ["Mars/Olympus", "../../etc/passwd", "/etc/localtime", "UTC+25"])
-def test_now_invalid_zone_message(key: str) -> None:
+@pytest.mark.parametrize("key", ["America/Los_Angeles", "PST", "Pacific Time"])
+def test_now_a_zone_showing_the_local_time_is_one_line(frozen_clock: None, key: str) -> None:
+    """The same UTC offset and abbreviation as the user's zone right now: one line that says so."""
+    assert format_now(key) == f"{_LOCAL}, also the time in America/Los_Angeles"
+
+
+def test_now_a_zone_keeping_the_local_time_all_year_is_one_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Other abbreviations, but the user's offset now, in January and in July: one line. The same
+    offset only now (Phoenix keeps UTC-7 through the winter) is two."""
+    _freeze(monkeypatch, _INSTANT, ZoneInfo("Asia/Kolkata"), "Asia/Kolkata", ("IST", "IST"))
+    local = "User's local time (Asia/Kolkata): Friday 2026-09-25 00:30:00 IST (UTC+05:30)"
+    assert format_now("Asia/Colombo") == f"{local}, also the time in Asia/Colombo"
+    _freeze(monkeypatch, _INSTANT)
+    assert format_now("America/Phoenix") == (
+        f"{_LOCAL}\nIn America/Phoenix: Thursday 2026-09-24 12:00:00 MST (UTC-07:00)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "line"),
+    [
+        ("utc", "In UTC: Thursday 2026-09-24 19:00:00 UTC (UTC+00:00)"),  # any case, any disk
+        ("europe/berlin", "In Europe/Berlin: Thursday 2026-09-24 21:00:00 CEST (UTC+02:00)"),
+        ("America/New York", "In America/New_York: Thursday 2026-09-24 15:00:00 EDT (UTC-04:00)"),
+        ("new york", "In America/New_York: Thursday 2026-09-24 15:00:00 EDT (UTC-04:00)"),
+        ("New York City", "In America/New_York: Thursday 2026-09-24 15:00:00 EDT (UTC-04:00)"),
+        ("Tokyo", "In Asia/Tokyo: Friday 2026-09-25 04:00:00 JST (UTC+09:00)"),
+        ("Apia", "In Pacific/Apia: Friday 2026-09-25 08:00:00 +13 (UTC+13:00)"),  # Samoa
+        ("São Paulo", "In America/Sao_Paulo: Thursday 2026-09-24 16:00:00 -03 (UTC-03:00)"),
+        # America/Buenos_Aires is a link that shows the same time: the current, deeper key wins
+        (
+            "buenos aires",
+            "In America/Argentina/Buenos_Aires: Thursday 2026-09-24 16:00:00 -03 (UTC-03:00)",
+        ),
+        # people mean Eastern time; the IANA key "EST" would be a fixed UTC-5 all summer
+        ("EST", "In America/New_York: Thursday 2026-09-24 15:00:00 EDT (UTC-04:00)"),
+        (
+            "Central Standard Time",
+            "In America/Chicago: Thursday 2026-09-24 14:00:00 CDT (UTC-05:00)",
+        ),
+        ("UTC+2", "In UTC+02:00: Thursday 2026-09-24 21:00:00 (UTC+02:00)"),
+        ("+05:30", "In UTC+05:30: Friday 2026-09-25 00:30:00 (UTC+05:30)"),
+        ("GMT-3", "In UTC-03:00: Thursday 2026-09-24 16:00:00 (UTC-03:00)"),
+        ("UTC-0", "In UTC+00:00: Thursday 2026-09-24 19:00:00 (UTC+00:00)"),  # zero has no sign
+    ],
+)
+def test_now_tolerant_zone_spelling(frozen_clock: None, key: str, line: str) -> None:
+    assert format_now(key) == f"{_LOCAL}\n{line}"
+
+
+def test_now_city_in_several_zones(frozen_clock: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keys ending in one city that show different times are an error naming them, never a
+    guess; keys that show the same time now count as one."""
+    cities = {
+        "springfield": ("America/Chicago", "America/New_York"),
+        "twin": ("Europe/Paris", "Europe/Berlin"),
+    }
+    monkeypatch.setattr(system, "_city_index", lambda: cities)
+    assert format_now("Springfield") == (
+        "ERROR: 'Springfield' matches several time zones (America/Chicago, America/New_York); "
+        "pass one of them."
+    )
+    assert format_now("twin").splitlines()[1] == (
+        "In Europe/Berlin: Thursday 2026-09-24 21:00:00 CEST (UTC+02:00)"
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "Mars/Olympus",
+        "../../etc/passwd",
+        "/etc/localtime",
+        "UTC+25",
+        "IST",  # India, Israel or Ireland: not guessed
+        "Canada/Vancouver",  # not a key; only a bare city is looked up by name
+        "Victoria",  # Australia/Victoria is a state (Melbourne), not a city
+        "Samoa",  # Pacific/Samoa is American Samoa; the country keeps Pacific/Apia
+        "East",  # Brazil/East
+        # a place in another script is a place, never "no zone": the model retries in English
+        "東京",
+        "Москва",
+        "Αθήνα",
+        "서울",
+        "القاهرة",
+        "🗼",
+        "\x00",
+        "x" * 5_000,
+    ],
+)
+def test_now_invalid_zone_message(frozen_clock: None, key: str) -> None:
     out = format_now(key)
-    assert out.startswith("ERROR: unknown time zone") and "IANA" in out
+    assert out.startswith("ERROR: unknown time zone") and "IANA" in out, out
+    assert "leave timezone out for the user's local time" in out and len(out) < 250
+
+
+def test_now_city_lookup_skips_region_links(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Old links named after a state or region are no city, on disks that still have them."""
+    keys = ["Australia/Melbourne", "Australia/Victoria", "Pacific/Apia", "Pacific/Samoa"]
+    keys += ["US/Hawaii", "Brazil/East", "Australia/Canberra", "America/North_Dakota/Center"]
+    monkeypatch.setattr(system, "_zone_index", lambda: {system._fold(key): key for key in keys})
+    assert system._city_index.__wrapped__() == {
+        "melbourne": ("Australia/Melbourne",),
+        "canberra": ("Australia/Canberra",),  # a city, though an old link too
+        "apia": ("Pacific/Apia",),
+        "center": ("America/North_Dakota/Center",),  # a town
+    }
+
+
+def test_now_without_a_zone_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows gives no IANA name for its zone: the user's time still comes first, labelled with
+    what the OS calls the zone. The user's own zone asked by name is one line, although Windows
+    never calls it 'PDT'."""
+    _freeze(monkeypatch, _INSTANT, name=None, names=_WINDOWS)
+    local = "User's local time: Thursday 2026-09-24 12:00:00 Pacific Daylight Time (UTC-07:00)"
+    assert format_now(None) == local
+    assert format_now("Asia/Tokyo") == (
+        f"{local}\nIn Asia/Tokyo: Friday 2026-09-25 04:00:00 JST (UTC+09:00)"
+    )
+    for key in ("America/Vancouver", "Vancouver"):
+        assert format_now(key) == f"{local}, also the time in America/Vancouver", key
+    assert format_now("PST") == f"{local}, also the time in America/Los_Angeles"
+    assert format_now("America/Phoenix").splitlines()[1].startswith("In America/Phoenix: ")
+
+
+@pytest.mark.parametrize("names", [("PST", "PDT"), _WINDOWS])  # a container, Windows
+def test_now_the_zone_the_description_names_is_local(
+    monkeypatch: pytest.MonkeyPatch, names: tuple[str, str]
+) -> None:
+    """Where the OS gives no IANA name, a model that copies the zone the description names, or the
+    abbreviation the clock shows, gets the user's time instead of an error."""
+    _freeze(monkeypatch, _INSTANT, name=None, names=names)
+    label = "/".join(names)
+    assert f"the user's local time ({label})." in system._make_now().description
+    local = f"User's local time: Thursday 2026-09-24 12:00:00 {names[1]} (UTC-07:00)"
+    for key in (label, names[1]):
+        assert format_now(key) == local, key
+
+
+def test_now_the_other_half_of_the_zone_name_is_elsewhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the abbreviation the clock shows now is the user's time: 'GMT' in a London summer is
+    an hour behind it."""
+    _freeze(monkeypatch, _INSTANT, ZoneInfo("Europe/London"), None, ("GMT", "BST"))
+    assert format_now("GMT") == (
+        "User's local time: Thursday 2026-09-24 20:00:00 BST (UTC+01:00)\n"
+        "In GMT: Thursday 2026-09-24 19:00:00 GMT (UTC+00:00)"
+    )
+
+
+def test_now_a_zone_name_the_clock_contradicts_is_left_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    _freeze(monkeypatch, _INSTANT, name="Asia/Tokyo")  # say, the zone changed after the start
+    assert format_now(None) == "User's local time: Thursday 2026-09-24 12:00:00 PDT (UTC-07:00)"
+
+
+def test_now_description_names_the_local_zone(frozen_clock: None) -> None:
+    description = system._make_now().description
+    assert "Without timezone it is the user's local time (America/Vancouver)." in description
+    assert "only when the user asks about another place" in description
+
+
+@pytest.mark.parametrize(("names", "label"), [(("UTC", "UTC"), "UTC"), (("", ""), "UTC-07:00")])
+def test_now_description_without_a_zone_name(
+    monkeypatch: pytest.MonkeyPatch, names: tuple[str, str], label: str
+) -> None:
+    """One name for both halves, or none (the other cases: see the test above)."""
+    _freeze(monkeypatch, _INSTANT, name=None, names=names)
+    description = system._make_now().description
+    assert f"Without timezone it is the user's local time ({label})." in description
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ("America/Vancouver", "America/Vancouver"),  # TZ or /etc/timezone
+        (":Asia/Tokyo", "Asia/Tokyo"),  # TZ with POSIX's optional colon
+        ("/var/db/timezone/zoneinfo/America/Vancouver", "America/Vancouver"),  # macOS link
+        ("../usr/share/zoneinfo/Europe/Berlin", "Europe/Berlin"),  # a relative link
+        ("/usr/share/zoneinfo/posix/America/New_York", "America/New_York"),
+        ("/usr/share/zoneinfo.default/Asia/Tokyo", "Asia/Tokyo"),
+        ("PST8PDT,M3.2.0,M11.1.0", None),  # a POSIX rule names no zone
+        ("/etc/localtime", None),
+        ("../../etc/passwd", None),
+        ("", None),
+    ],
+)
+def test_now_zone_key_in(text: str, key: str | None) -> None:
+    assert system._zone_key_in(text) == key
+
+
+def test_now_detects_the_zone_from_tz(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A set TZ wins over /etc/localtime, as in the C library, even when it names no zone."""
+    monkeypatch.setenv("TZ", ":America/Vancouver")
+    assert system._detect_local_zone() == "America/Vancouver"
+    monkeypatch.setenv("TZ", "EST5EDT,M3.2.0,M11.1.0")
+    assert system._detect_local_zone() is None
 
 
 def test_now_real_clock_format() -> None:
-    out = format_now("UTC")
-    assert re.fullmatch(r"\w+ \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \(UTC\+00:00\), in UTC", out)
-    assert str(datetime.now(UTC).year) in out
-    assert format_now(None).endswith(", local time")
+    local = format_now(None)
+    assert local.startswith("User's local time") and "\n" not in local
+    utc = format_now("UTC")  # its own line, or the local line on a machine that keeps UTC
+    assert "(UTC+00:00)" in utc and str(datetime.now(UTC).year) in utc, utc
+    far = format_now("Pacific/Chatham")  # UTC+12:45/+13:45, which no test machine keeps
+    assert far.startswith("User's local time")
+    assert re.fullmatch(
+        r"In Pacific/Chatham: \w+ \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \+1[23]45 \(UTC\+1[23]:45\)",
+        far.splitlines()[-1],
+    ), far
 
 
 def test_now_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    def broken(zone: tzinfo | None) -> datetime:
+    def broken(*_: object) -> datetime:
         raise OSError("no clock")
 
+    _freeze(monkeypatch, _INSTANT)
+    monkeypatch.setattr(system, "_local_zone_name", broken)  # detection fails: no name, same time
+    assert format_now(None) == "User's local time: Thursday 2026-09-24 12:00:00 PDT (UTC-07:00)"
+    _freeze(monkeypatch, _INSTANT, name=None, names=_WINDOWS)
+    monkeypatch.setattr(system, "_os_clock", broken)  # January and July cannot be read: two lines
+    assert format_now("America/Vancouver").splitlines()[1].startswith("In America/Vancouver: ")
     monkeypatch.setattr(system, "_current_time", broken)
     assert format_now("Asia/Tokyo") == "ERROR: could not read the clock (no clock)."
+    assert "the user's local time. Pass" in system._make_now().description
 
 
-def test_now_tool_contract() -> None:
+def test_now_tool_contract(frozen_clock: None) -> None:
     assert now.name == "now"
     assert list(now.args) == ["timezone"]
-    assert "UTC" in now.invoke({"timezone": "UTC"})
-    assert now.invoke({}).endswith(", local time")
+    assert now.invoke({}) == _LOCAL
+    assert now.invoke({"timezone": "Asia/Tokyo"}).startswith(f"{_LOCAL}\nIn Asia/Tokyo: ")
+    assert "Without timezone it is the user's local time" in now.description
 
 
 # --- git ----------------------------------------------------------------------------------------

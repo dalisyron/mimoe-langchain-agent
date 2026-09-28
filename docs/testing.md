@@ -21,7 +21,7 @@ demo prompt takes 25 to 30 s.
   suite, the live smoke tests, the demo prompts in the terminal and the browser, and a real Ctrl-C
   under a terminal (the turn ends within 0.2 s).
 - Windows Server 2025 (x64, CPU-only VM) with the Studio 1.0.27 runtime, installed from a ZIP of
-  this repository: the offline suite (all pass; 7 POSIX-only tests skip), the five demo prompts,
+  this repository: the offline suite (all pass; 19 POSIX-only tests skip), the five demo prompts,
   approve and deny, the web UI and API, a UTF-16 `.env`, and the Stop, memory and timeout kills
   (no `python.exe` left behind).
 - Ubuntu through CI (offline tests only).
