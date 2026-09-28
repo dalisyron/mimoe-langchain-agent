@@ -29,7 +29,7 @@ from mimoe_agent.config import Settings, load_settings
 from mimoe_agent.mimoe import EngineGeneration, MimoeClient, preflight
 from mimoe_agent.stream import iter_events
 from mimoe_agent.tools import build_tools
-from mimoe_agent.tools.system import calculate
+from mimoe_agent.tools.calculator import calculate
 
 LIVE = os.environ.get("MIMOE_LIVE") == "1"
 BASE_URL = os.environ.get("MIMOE_BASE_URL") or "http://127.0.0.1:8083/mimik-ai/openai/v1"
@@ -131,12 +131,14 @@ def _tool_names(message: dict[str, Any]) -> list[str]:
     return [call["function"]["name"] for call in message.get("tool_calls") or []]
 
 
-def test_the_real_model_moves_from_a_refused_calculator_call_to_run_python(
-    workspace_tmp: Path,
-) -> None:
-    """Replays a real web-session step: after the calculator refused a generator expression,
-    qwen3-4b-instruct-2507 resent it (3 of 3 runs with the old "unsupported syntax" text) and
-    then guessed a number. With the error that names run_python, its next step is run_python."""
+def test_the_real_model_answers_from_the_calculators_count(workspace_tmp: Path) -> None:
+    """Replays a real web-session step: asked for the primes between 1000 and 4500,
+    qwen3-4b-instruct-2507 sent the calculator a generator expression. The calculator used to
+    refuse it (the model resent it and guessed 543; later an error that named run_python sent it
+    there, behind an approval prompt). It now evaluates the expression, and the model's next
+    step answers with that count instead of calling another tool."""
+    result = calculate(PRIMES)
+    assert result == "442"
     call = {"name": "calculator", "arguments": json.dumps({"expression": PRIMES})}
     message = _next_step(
         _settings(workspace_tmp, workspace_tmp.parent),
@@ -155,11 +157,12 @@ def test_the_real_model_moves_from_a_refused_calculator_call_to_run_python(
                 "role": "tool",
                 "tool_call_id": "tool_0",
                 "name": "calculator",
-                "content": calculate(PRIMES),
+                "content": result,
             },
         ],
     )
-    assert _tool_names(message) == ["run_python"], message
+    assert not _tool_names(message), message
+    assert "442" in str(message.get("content") or ""), message
 
 
 def test_the_real_model_computes_numbers_with_a_tool(workspace_tmp: Path) -> None:

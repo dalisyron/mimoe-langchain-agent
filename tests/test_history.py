@@ -153,10 +153,15 @@ def test_transcript_mirrors_the_stream() -> None:
         HumanMessage("What is the sum of 10 to 20?"),
         reply(
             "I'll compute it.",
-            call("calculator", expression="sum(range(10, 21))"),
+            call("calculator", expression="sum_between(10, 20)"),  # a function it has not
             additional_kwargs={"reasoning_content": " The user wants a sum. "},
         ),
-        ToolMessage("ERROR: unknown function 'range'.", tool_call_id="tool_0", status="error"),
+        ToolMessage(
+            "ERROR: unknown function 'sum_between'; the calculator has Python's built-in "
+            "functions such as sum, len, range, sorted, min, max, round and abs.",
+            tool_call_id="tool_0",
+            status="error",
+        ),
         reply("", call("run_python", code="print(sum(range(10, 21)))")),
         ToolMessage("exit_code: 0\nstdout:\n165", tool_call_id="tool_0", name="run_python"),
         reply("The sum is 165."),

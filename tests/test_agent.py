@@ -371,7 +371,9 @@ async def test_v10_thinking_answer_is_checkpointed_without_leading_whitespace(
 
 # -- a refused calculator call ------------------------------------------------------------------
 
-PRIMES = "sum(1 for n in range(1000, 4501) if all(n % i != 0 for i in range(2, int(n**0.5) + 1)))"
+# The real session's call was a generator expression, which the calculator now evaluates; a call
+# to a function it does not have (the model invents one now and then) is still refused.
+PRIMES = "sum(1 for n in range(1000, 4501) if isprime(n))"
 PRIMES_CALL = {"tool_calls": [{"name": "calculator", "args": {"expression": PRIMES}}]}
 
 

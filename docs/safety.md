@@ -68,8 +68,15 @@ The other tools:
 - Everything the model, a tool or the engine says is shown in the terminal with control
   sequences escaped: an ESC in a file or an answer could otherwise move the cursor, retitle the
   window or write your clipboard (OSC 52).
-- `calculator` evaluates through an AST whitelist, no `eval`; expressions that would produce more
-  than 100,000 digits are refused before they are computed.
+- `calculator` needs no approval because it runs no Python code. It parses one expression and
+  evaluates it with its own interpreter, never `eval`, `exec` or `compile`: syntax outside a
+  whitelist is refused, there is no attribute access except fixed tables of `math.` and
+  `statistics.` functions, no name that starts with `_` and no string formatting, so nothing can
+  climb from a value to its class, module or builtins (the route of known escapes from other
+  "safe eval" libraries). Every call is bounded before the work runs: integers of at most 100,000
+  digits, 3,000,000 steps, 100 MB of values and 2 s, plus cost bounds for single C-level
+  operations that no deadline can interrupt (modular `pow`, `comb`, hashing a large set). What
+  gets past this is a slow or refused calculation, not code execution.
 - The web server binds `127.0.0.1` only, has no `--host` flag, accepts only `127.0.0.1`,
   `localhost` and `[::1]` as the `Host` header (a DNS-rebinding page in your browser cannot drive
   it), has no CORS and no authentication: it is a single-user tool. The UI renders model output as

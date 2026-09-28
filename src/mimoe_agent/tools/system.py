@@ -1,14 +1,10 @@
-"""System tools: ``calculator``, ``now``, ``git`` and ``mimoe_status``.
+"""System tools: ``now``, ``git`` and ``mimoe_status`` (``calculator`` has a module of its own,
+:mod:`mimoe_agent.tools.calculator`).
 
 Every tool here returns a string, never raises and never returns ``""``: a failure becomes a
 readable ``ERROR: ...`` line, because the model reads the result verbatim and small models
 fabricate numbers when a tool result is empty.
 
-* ``calculator`` evaluates arithmetic through an ``ast`` whitelist (no ``eval``). Powers and
-  products that would exceed ``MAX_RESULT_DIGITS`` digits, factorials above ``MAX_FACTORIAL`` and
-  ``round()`` with extreme precision are refused *before* they are computed, so a "bomb" costs
-  microseconds instead of minutes. The digit bound also keeps the quadratic big-integer paths
-  (``gcd``, ``%``, ``//``) on the largest allowed operands at a fraction of a second.
 * ``now`` uses ``zoneinfo``. The OS local zone needs no database; named zones come from the OS
   on macOS/Linux and from the ``tzdata`` package on Windows (declared in ``pyproject.toml``).
 * ``git`` is one read-only tool (status / log / diff). It runs ``git`` with list arguments and
@@ -23,15 +19,12 @@ fabricate numbers when a tool result is empty.
 
 from __future__ import annotations
 
-import ast
-import math
-import operator
 import os
 import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
@@ -44,8 +37,6 @@ __all__ = [
     "GIT_TIMEOUT_S",
     "StatusClient",
     "WorkspaceLike",
-    "calculate",
-    "calculator",
     "format_now",
     "make_git",
     "make_mimoe_status",
@@ -54,287 +45,9 @@ __all__ = [
     "run_git",
 ]
 
-Number = int | float
-
 
 class _ToolError(Exception):
     """Internal control flow: carries a finished ``ERROR: ...`` line to the tool boundary."""
-
-
-# --- calculator ---------------------------------------------------------------------------------
-
-MAX_EXPRESSION_CHARS = 500
-MAX_RESULT_DIGITS = 100_000  # 10**6 let gcd(...) and % on maximal operands stall for 10-20 s
-MAX_FACTORIAL = 5_000
-MAX_ROUND_DIGITS = 100
-_MAX_RESULT_BITS = int(MAX_RESULT_DIGITS * math.log2(10)) + 1
-_TOO_LARGE = f"the result would have more than {MAX_RESULT_DIGITS:,} digits"
-_UNICODE_OPERATORS = str.maketrans({"×": "*", "÷": "/", "−": "-"})
-
-
-def _check_size(value: Any) -> Any:
-    """Reject integers above the digit bound; other values pass through unchanged."""
-    is_integer = isinstance(value, int) and not isinstance(value, bool)
-    if is_integer and value.bit_length() > _MAX_RESULT_BITS:
-        raise ValueError(_TOO_LARGE)
-    return value
-
-
-def _checked_pow(base: Number, exponent: Number) -> Number:
-    """``base ** exponent`` with the digit bound estimated before anything big is computed."""
-    if isinstance(base, int) and isinstance(exponent, int) and exponent > 1 and abs(base) > 1:
-        # bit_length() first: it guards the float multiplication against an OverflowError.
-        too_big = exponent.bit_length() > 40
-        if too_big or exponent * math.log10(abs(base)) > MAX_RESULT_DIGITS:
-            raise ValueError(_TOO_LARGE)
-    return operator.pow(base, exponent)
-
-
-def _checked_mul(left: Number, right: Number) -> Number:
-    """``left * right`` refused up front when the product would exceed the digit bound."""
-    if (
-        isinstance(left, int)
-        and isinstance(right, int)
-        and left.bit_length() + right.bit_length() > _MAX_RESULT_BITS
-    ):
-        raise ValueError(_TOO_LARGE)
-    return operator.mul(left, right)
-
-
-def _checked_round(value: Number, ndigits: Number | None = None) -> Number:
-    """``round`` with bounded precision (``round(5, -10**9)`` would otherwise build 10**10**9)."""
-    if ndigits is None:
-        return round(value)
-    if isinstance(ndigits, bool) or not isinstance(ndigits, int) or abs(ndigits) > MAX_ROUND_DIGITS:
-        raise ValueError(f"round() accepts at most {MAX_ROUND_DIGITS} digits of precision")
-    return round(value, ndigits)
-
-
-def _checked_factorial(value: Number) -> int:
-    """``factorial`` for whole numbers up to ``MAX_FACTORIAL``."""
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_FACTORIAL:
-        raise ValueError(f"factorial() needs a whole number between 0 and {MAX_FACTORIAL}")
-    return math.factorial(value)
-
-
-_BINARY_OPS: dict[type[ast.operator], Callable[[Any, Any], Any]] = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: _checked_mul,
-    ast.Div: operator.truediv,
-    ast.FloorDiv: operator.floordiv,
-    ast.Mod: operator.mod,
-    ast.Pow: _checked_pow,
-}
-_UNARY_OPS: dict[type[ast.unaryop], Callable[[Any], Any]] = {
-    ast.UAdd: operator.pos,
-    ast.USub: operator.neg,
-}
-_FUNCTIONS: dict[str, Callable[..., Any]] = {
-    "abs": abs,
-    "round": _checked_round,
-    "min": min,
-    "max": max,
-    "sum": sum,
-    "sqrt": math.sqrt,
-    "exp": math.exp,
-    "log": math.log,
-    "log2": math.log2,
-    "log10": math.log10,
-    "sin": math.sin,
-    "cos": math.cos,
-    "tan": math.tan,
-    "asin": math.asin,
-    "acos": math.acos,
-    "atan": math.atan,
-    "atan2": math.atan2,
-    "floor": math.floor,
-    "ceil": math.ceil,
-    "trunc": math.trunc,
-    "degrees": math.degrees,
-    "radians": math.radians,
-    "hypot": math.hypot,
-    "gcd": math.gcd,
-    "factorial": _checked_factorial,
-    "pow": _checked_pow,
-    "int": int,
-    "float": float,
-}
-_CONSTANTS: dict[str, float] = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf}
-
-
-RUN_PYTHON_HINT = (
-    "For counting, loops or anything beyond one arithmetic expression, call run_python with "
-    "code that prints the result"
-)
-"""Appended to every rejection that means "this is code, not arithmetic". A small model that
-only reads "unsupported syntax" tends to resend the same expression and then guess a number;
-naming the tool that can do it sends it to run_python instead (measured on
-qwen3-4b-instruct-2507)."""
-
-_CODE_SYNTAX: tuple[tuple[type[ast.AST], str], ...] = (
-    (ast.GeneratorExp, "a generator expression"),
-    (ast.ListComp, "a list comprehension"),
-    (ast.SetComp, "a set comprehension"),
-    (ast.DictComp, "a dict comprehension"),
-    (ast.Lambda, "a lambda"),
-    (ast.IfExp, "a conditional expression"),
-    (ast.Compare, "a comparison"),
-    (ast.BoolOp, "and/or logic"),
-    (ast.Subscript, "indexing"),
-    (ast.Attribute, "attribute access"),
-    (ast.NamedExpr, "an assignment"),
-    (ast.JoinedStr, "an f-string"),
-    (ast.Starred, "unpacking"),
-)
-
-
-def _not_arithmetic(node: ast.AST) -> ValueError:
-    """The rejection for syntax the calculator does not evaluate, pointing at run_python."""
-    what = next((label for kind, label in _CODE_SYNTAX if isinstance(node, kind)), None)
-    if what is None:
-        return ValueError(f"unsupported syntax: {type(node).__name__}. {RUN_PYTHON_HINT}")
-    return ValueError(
-        f"the calculator evaluates one arithmetic expression; it cannot run {what} (loops, "
-        f"comprehensions and conditions are Python code). {RUN_PYTHON_HINT}"
-    )
-
-
-def _eval_node(node: ast.AST) -> Any:
-    """Evaluate one whitelisted AST node; anything else raises ``ValueError``."""
-    if isinstance(node, ast.Constant):
-        value = node.value
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ValueError(f"only numbers are allowed, not {value!r}")
-        return value
-    if isinstance(node, ast.Name):
-        if node.id in _CONSTANTS:
-            return _CONSTANTS[node.id]
-        raise ValueError(
-            f"unknown name {node.id!r}; the calculator has no variables, only numbers, operators "
-            f"and functions such as sqrt(), round() or log(). {RUN_PYTHON_HINT}"
-        )
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
-        return _UNARY_OPS[type(node.op)](_eval_node(node.operand))
-    if isinstance(node, ast.BinOp):
-        if isinstance(node.op, ast.BitXor):
-            raise ValueError("'^' is bitwise XOR in Python; use ** for powers, e.g. 2**10")
-        apply = _BINARY_OPS.get(type(node.op))
-        if apply is None:
-            raise ValueError(f"the {type(node.op).__name__} operator is not supported")
-        return _check_size(apply(_eval_node(node.left), _eval_node(node.right)))
-    if isinstance(node, ast.Call):
-        return _check_size(_eval_call(node))
-    if isinstance(node, ast.Tuple):
-        raise ValueError("commas are not allowed; write 1000 instead of 1,000")
-    raise _not_arithmetic(node)
-
-
-def _eval_call(node: ast.Call) -> Any:
-    """Call a whitelisted function; ``math.sqrt(2)`` is accepted as a spelling of ``sqrt(2)``."""
-    func = node.func
-    is_math_attr = isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
-    if is_math_attr and func.value.id == "math":
-        name = func.attr
-    elif isinstance(func, ast.Name):
-        name = func.id
-    else:
-        raise ValueError(
-            f"only plain function calls such as sqrt(2) are allowed. {RUN_PYTHON_HINT}"
-        )
-    apply = _FUNCTIONS.get(name)
-    if apply is None:
-        raise ValueError(
-            f"unknown function {name!r}; available: {', '.join(sorted(_FUNCTIONS))}. "
-            f"{RUN_PYTHON_HINT}"
-        )
-    if node.keywords:
-        raise ValueError(f"{name}() takes positional arguments only")
-    return apply(*[_eval_argument(argument) for argument in node.args])
-
-
-def _eval_argument(node: ast.AST) -> Any:
-    """Function arguments may also be list or tuple literals, for ``min([1, 2])`` and ``sum``."""
-    if isinstance(node, ast.List | ast.Tuple):
-        return [_eval_node(element) for element in node.elts]
-    return _eval_node(node)
-
-
-def _scientific(value: int) -> str:
-    """Approximate a huge integer as ``m.mmmmmme+N`` without a full decimal conversion."""
-    magnitude = math.log10(abs(value))
-    exponent = int(magnitude)
-    mantissa = f"{10 ** (magnitude - exponent):.6g}"
-    if mantissa.startswith("10"):
-        mantissa, exponent = "1", exponent + 1
-    sign = "-" if value < 0 else ""
-    return f"{sign}{mantissa}e+{exponent} (about {exponent + 1:,} digits)"
-
-
-def _format_result(value: Any) -> str:
-    """Render a result plainly: integers as digits, floats with 12 significant digits."""
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return "ERROR: the result is not a real number."
-    if isinstance(value, float):
-        if math.isnan(value):
-            return "nan (undefined result)"
-        if math.isinf(value):
-            return "inf" if value > 0 else "-inf"
-        if value.is_integer() and abs(value) < 1e15:
-            return str(int(value))
-        return f"{value:.12g}"
-    try:
-        return str(value)
-    except ValueError:  # beyond sys.get_int_max_str_digits()
-        return _scientific(value)
-
-
-def calculate(expression: str) -> str:
-    """Evaluate an arithmetic expression safely and return the result as text.
-
-    Args:
-        expression: Python-syntax arithmetic such as ``"1836.6 * 0.15"`` or ``"sqrt(2) + 2**10"``.
-            Unicode ``×``, ``÷`` and ``−`` are accepted; a stray ``=`` is ignored.
-
-    Returns:
-        The number as plain text, or an ``ERROR: ...`` line explaining what was rejected.
-    """
-    text = str(expression).translate(_UNICODE_OPERATORS).strip().strip("`").strip("= ")
-    if not text:
-        return "ERROR: empty expression; send arithmetic such as 2 + 2."
-    if len(text) > MAX_EXPRESSION_CHARS:
-        return f"ERROR: expression longer than {MAX_EXPRESSION_CHARS} characters; split it up."
-    try:
-        result = _eval_node(ast.parse(text, mode="eval").body)
-    except SyntaxError as exc:
-        return (
-            f"ERROR: not a valid arithmetic expression ({exc.msg}); use Python syntax such as "
-            "1836.6 * 0.15 or sqrt(2)."
-        )
-    except ZeroDivisionError:
-        return "ERROR: division by zero."
-    except OverflowError:
-        return "ERROR: the result is too large to represent as a number."
-    except (RecursionError, MemoryError):
-        return "ERROR: the expression is too deeply nested."
-    except ValueError as exc:
-        detail = str(exc)
-        if "math domain error" in detail:
-            detail = "math domain error (square root or logarithm of a negative number?)"
-        return f"ERROR: {detail}."
-    except TypeError as exc:
-        return f"ERROR: invalid arguments ({exc})."
-    return _format_result(result)
-
-
-@tool
-def calculator(expression: str) -> str:
-    """Evaluate one arithmetic expression in Python syntax (e.g. '1836.6 * 0.15', 'sqrt(2) + 2**10')
-    and return the number. Only numbers, + - * / // % **, parentheses and math functions such as
-    sqrt, log, round, min, max, factorial are allowed; use ** for powers, not ^. It cannot run
-    loops, comprehensions, conditions, range() or variables: for counting, loops or anything over
-    many values, use run_python."""
-    return calculate(expression)
 
 
 # --- now ----------------------------------------------------------------------------------------

@@ -130,8 +130,8 @@ What each module does, in reading order:
   `reasoning_content` on 1.0) and makes tool-call ids unique (mimOE numbers every reply from
   `tool_0`).
 - `tools/`: `workspace.py` (the path jail and `list_files`, `read_file`, `search_files`),
-  `run_python.py` with `_runner.py` (the child interpreter), `system.py` (`calculator`, `now`,
-  `git`, `mimoe_status`).
+  `run_python.py` with `_runner.py` (the child interpreter), `calculator.py` (a small interpreter
+  for one Python expression, with its limits) and `system.py` (`now`, `git`, `mimoe_status`).
 - `models.py`: the six model presets with their measured notes, `pull` through the registry of
   either generation, and `switch_model`.
 - `cli.py`: the REPL, `serve`, and the `models` subcommands. Each turn runs on a worker thread

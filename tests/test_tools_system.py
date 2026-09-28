@@ -1,4 +1,5 @@
-"""Offline tests for tools/system.py: calculator, now, git and mimoe_status.
+"""Offline tests for tools/system.py: now, git and mimoe_status (the calculator's tests are in
+test_tools_calculator.py).
 
 The git tests build a throwaway repository with an explicit identity and an isolated HOME, so
 the developer's global git configuration cannot change the output; they are skipped when git is
@@ -12,7 +13,6 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
@@ -24,10 +24,9 @@ import pytest
 from pydantic import ValidationError
 
 from mimoe_agent.tools import system
+from mimoe_agent.tools.calculator import calculator
 from mimoe_agent.tools.system import (
     GIT_RESULT_CAP,
-    calculate,
-    calculator,
     format_now,
     make_git,
     make_mimoe_status,
@@ -51,209 +50,6 @@ class _Workspace:
         if not candidate.is_relative_to(self.root):
             raise ValueError(f"{rel!r} escapes the workspace")
         return candidate
-
-
-# --- calculator ---------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("expression", "expected"),
-    [
-        ("2 + 3", "5"),
-        ("10 - 4 * 2", "2"),
-        ("(10 - 4) * 2", "12"),
-        ("2**3**2", "512"),
-        ("-2**2", "-4"),
-        ("7 / 2", "3.5"),
-        ("7 // 2", "3"),
-        ("7 % 3", "1"),
-        ("1836.6 * 0.15", "275.49"),
-        ("0.1 + 0.2", "0.3"),
-        ("1/3", "0.333333333333"),
-        ("2**100", "1267650600228229401496703205376"),
-        ("2×3", "6"),
-        ("10 ÷ 4", "2.5"),
-        ("2+2=", "4"),
-        ("1e3", "1000"),
-        ("1_000 + 1", "1001"),
-    ],
-)
-def test_calculator_basic_and_precedence(expression: str, expected: str) -> None:
-    assert calculate(expression) == expected
-
-
-@pytest.mark.parametrize(
-    ("expression", "expected"),
-    [
-        ("sqrt(16)", "4"),
-        ("round(3.14159, 2)", "3.14"),
-        ("round(2.5)", "2"),
-        ("max(1, 5, 3)", "5"),
-        ("min([4, 2, 8])", "2"),
-        ("sum([1, 2, 3.5])", "6.5"),
-        ("abs(-7)", "7"),
-        ("floor(2.7)", "2"),
-        ("ceil(2.1)", "3"),
-        ("log10(1000)", "3"),
-        ("log2(8)", "3"),
-        ("log(e)", "1"),
-        ("sin(pi/2)", "1"),
-        ("cos(0)", "1"),
-        ("tan(0)", "0"),
-        ("2 * pi", "6.28318530718"),
-        ("factorial(20)", "2432902008176640000"),
-        ("gcd(12, 18)", "6"),
-        ("pow(2, 10)", "1024"),
-        ("math.sqrt(2)", "1.41421356237"),
-    ],
-)
-def test_calculator_functions_and_constants(expression: str, expected: str) -> None:
-    assert calculate(expression) == expected
-
-
-@pytest.mark.parametrize(
-    "expression",
-    [
-        "9**9**9",
-        "2**10**7",
-        "(10**500)**10000",
-        "pow(2, 10**8)",
-        "10**600000 * 10**600000",
-        "factorial(100000)",
-        "round(5, -10**9)",
-    ],
-)
-def test_calculator_rejects_bombs_quickly(expression: str) -> None:
-    started = time.perf_counter()
-    out = calculate(expression)
-    assert time.perf_counter() - started < 5.0
-    assert out.startswith("ERROR:")
-    assert "digits" in out or "factorial" in out or "precision" in out
-
-
-def test_calculator_large_but_allowed_results_are_summarised() -> None:
-    assert calculate("10**5000") == "1e+5000 (about 5,001 digits)"
-    out = calculate("2**100000")
-    assert out.startswith("9.99002e+30102") and "30,103 digits" in out
-    assert calculate("2**332000").endswith("(about 99,942 digits)")  # just under the bound
-    refused = calculate("10**100001")
-    assert refused.startswith("ERROR:") and "100,000 digits" in refused
-
-
-@pytest.mark.parametrize(
-    "expression",
-    [
-        "gcd(2**332100 - 1, 3**209500 - 1)",  # Lehmer gcd is quadratic in the operand size
-        "10**99999 % 10**50000",  # schoolbook division, quadratic in quotient x divisor
-        "10**99999 // 10**50000",
-        "10**99999 * 10**99999",
-    ],
-)
-def test_calculator_quadratic_big_int_paths_stay_fast(expression: str) -> None:
-    """With a 10**6-digit bound these took 10-20 s each; the bound is what keeps them cheap."""
-    started = time.perf_counter()
-    out = calculate(expression)
-    assert time.perf_counter() - started < 2.0, out
-    assert not out.startswith("ERROR:") or "digits" in out
-
-
-def test_calculator_caret_hint() -> None:
-    out = calculate("2^3")
-    assert out.startswith("ERROR:") and "**" in out and "^" in out
-    assert calculate("10^10**10").startswith("ERROR: '^'")  # the hint wins over the bomb check
-
-
-PRIMES = "sum(1 for n in range(1000, 4501) if all(n % i != 0 for i in range(2, int(n**0.5) + 1)))"
-
-
-@pytest.mark.parametrize(
-    ("expression", "what"),
-    [
-        (PRIMES, "it cannot run a generator expression"),
-        ("[n * 2 for n in (1, 2)]", "it cannot run a list comprehension"),
-        ("1 if 2 > 1 else 0", "it cannot run a conditional expression"),
-        ("3 > 2", "it cannot run a comparison"),
-        ("range(10)", "unknown function 'range'"),
-        ("n * 2", "unknown name 'n'; the calculator has no variables"),
-        ("x.real", "it cannot run attribute access"),
-    ],
-)
-def test_calculator_sends_code_to_run_python(expression: str, what: str) -> None:
-    """Code is refused with a pointer to run_python: with the bare "unsupported syntax:
-    GeneratorExp" qwen3-4b resent the same expression and then guessed a number."""
-    out = calculate(expression)
-    assert out.startswith("ERROR: ") and what in out
-    assert "call run_python with code that prints the result" in out
-
-
-def test_calculator_description_says_what_it_cannot_do() -> None:
-    description = " ".join(calculator.description.split())  # the docstring wraps lines
-    assert "cannot run loops, comprehensions, conditions, range() or variables" in description
-    assert "use run_python" in description
-    assert calculate("2**10 + sqrt(16)") == "1028"  # arithmetic is unchanged
-
-
-@pytest.mark.parametrize("expression", ["1/0", "5 % 0", "7 // 0", "1 / (2 - 2)"])
-def test_calculator_division_by_zero(expression: str) -> None:
-    assert calculate(expression) == "ERROR: division by zero."
-
-
-@pytest.mark.parametrize(
-    ("expression", "fragment"),
-    [
-        ("hello", "unknown name 'hello'"),
-        ("what is two plus two", "not a valid arithmetic expression"),
-        ("'a' * 3", "only numbers are allowed"),
-        ("True + 1", "only numbers are allowed"),
-        ("12,000 + 5", "commas are not allowed"),
-        ("", "empty expression"),
-        ("   ", "empty expression"),
-        ("x" * 501, "longer than 500 characters"),
-    ],
-)
-def test_calculator_non_numeric_input(expression: str, fragment: str) -> None:
-    out = calculate(expression)
-    assert out.startswith("ERROR:") and fragment in out
-
-
-@pytest.mark.parametrize(
-    "expression",
-    [
-        "__import__('os').system('id')",
-        "open('/etc/passwd').read()",
-        "().__class__",
-        "[1] * 10**9",
-        "lambda: 1",
-        "1 < 2",
-        "1 if 1 else 2",
-        "min(x=1)",
-        "1j + 1",
-    ],
-)
-def test_calculator_refuses_non_arithmetic_syntax(expression: str) -> None:
-    assert calculate(expression).startswith("ERROR:")
-
-
-@pytest.mark.parametrize(
-    ("expression", "fragment"),
-    [
-        ("sqrt(-1)", "math domain error"),
-        ("exp(1000)", "too large"),
-        ("float(10**400)", "too large"),
-        ("(-8) ** (1/3)", "not a real number"),
-        ("max()", "invalid arguments"),
-        ("1e400", "inf"),
-    ],
-)
-def test_calculator_domain_and_overflow_messages(expression: str, fragment: str) -> None:
-    assert fragment in calculate(expression)
-
-
-def test_calculator_tool_contract() -> None:
-    assert calculator.name == "calculator"
-    assert list(calculator.args) == ["expression"]
-    assert "**" in calculator.description
-    assert calculator.invoke({"expression": "6 * 7"}) == "42"
 
 
 # --- now ----------------------------------------------------------------------------------------

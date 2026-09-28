@@ -173,8 +173,11 @@ def make_run_python(ws: Workspace, *, allow_network: bool, approval: bool = True
 def run_python_code(code: str, ws: Workspace, *, allow_network: bool, timeout_s: float, memory_limit_mb: int = MEMORY_LIMIT_MB, cancel: threading.Event | None = None) -> RunResult
 CANCEL_KEY = "mimoe_cancel"   # config["configurable"][CANCEL_KEY]: a threading.Event per turn; set by Ctrl-C (CLI) or Stop/disconnect (server), it kills the snippet's tree
 MEMORY_LIMIT_MB = 2048        # resident memory of the whole tree (psutil); above it the tree is killed
+# calculator.py
+def calculate(expression: str) -> str   # its own interpreter over a whitelisted AST; no eval/exec, never compiled to bytecode
+calculator: BaseTool
 # system.py
-calculator: BaseTool; now: BaseTool
+now: BaseTool
 def make_git(ws: Workspace) -> BaseTool
 def make_mimoe_status(client: MimoeClient) -> BaseTool
 ```

@@ -33,8 +33,9 @@ def build_tools(settings: Settings, client: MimoeClient | None = None) -> list[B
     workspace tools are jailed to ``settings.workspace``; ``mimoe_status`` reads the engine
     through ``client`` (a fresh ``MimoeClient`` is created when none is given).
     """
+    from mimoe_agent.tools.calculator import calculator
     from mimoe_agent.tools.run_python import make_run_python
-    from mimoe_agent.tools.system import calculator, make_git, make_mimoe_status, now
+    from mimoe_agent.tools.system import make_git, make_mimoe_status, now
     from mimoe_agent.tools.workspace import Workspace, make_workspace_tools
 
     if client is None:

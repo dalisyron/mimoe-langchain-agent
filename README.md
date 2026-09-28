@@ -151,7 +151,9 @@ done, and `--allow-network` makes it easy. The REPL's banner warns when you comb
   Enter cannot approve code you have not seen.
 - The other tools never touch the network (`mimoe_status` only asks the engine). The file tools
   are jailed to the workspace and refuse credential files; `git` is read-only and runs none of the
-  repository's hooks.
+  repository's hooks. `calculator` runs no Python: it interprets one expression over a whitelist
+  (no attribute access, imports or statements) within step, memory and time limits, which is why
+  it needs no approval.
 - The web server listens on `127.0.0.1` only and accepts only loopback `Host` headers, so a
   DNS-rebinding page cannot drive it. It has no authentication: it is a single-user tool. Answers
   render without raw HTML or images (an image URL could leak file contents).
